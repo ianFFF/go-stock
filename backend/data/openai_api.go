@@ -82,3 +82,28 @@ func NewDeepSeekOpenAi(ctx context.Context, aiConfigId int) *OpenAi {
 	}
 	return o
 }
+
+// NewOpenAiFromParams builds OpenAi for callers outside package data (e.g. CLI) that set ApiKey/BaseUrl/Model
+// from environment variables instead of SQLite. Does not read GetSettingConfig.
+func NewOpenAiFromParams(ctx context.Context, baseURL, apiKey, model string, temperature float64, maxTokens, timeOut int, httpProxy string, httpProxyEnabled bool, chatSource string) *OpenAi {
+	if timeOut <= 0 {
+		timeOut = 300
+	}
+	if temperature <= 0 {
+		temperature = 0.4
+	}
+	return &OpenAi{
+		ctx:              ctx,
+		BaseUrl:          baseURL,
+		ApiKey:           apiKey,
+		Model:            model,
+		MaxTokens:        maxTokens,
+		Temperature:      temperature,
+		TimeOut:          timeOut,
+		HttpProxy:        httpProxy,
+		HttpProxyEnabled: httpProxyEnabled,
+		CrawlTimeOut:     60,
+		KDays:            60,
+		ChatSource:       chatSource,
+	}
+}

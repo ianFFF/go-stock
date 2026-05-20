@@ -220,6 +220,53 @@ func removeRequestField(messages []map[string]interface{}, field string) []map[s
 	return result
 }
 
+type thinkingFieldMode string
+
+const (
+	thinkingFieldOmitted  thinkingFieldMode = ""
+	thinkingFieldEnabled  thinkingFieldMode = "enabled"
+	thinkingFieldDisabled thinkingFieldMode = "disabled"
+)
+
+func shouldExplicitlyDisableThinking(o *OpenAi) bool {
+	if o == nil {
+		return false
+	}
+	lowerModel := strings.ToLower(strings.TrimSpace(o.Model))
+	lowerBaseURL := strings.ToLower(strings.TrimSpace(o.BaseUrl))
+	return strings.Contains(lowerModel, "deepseek") || strings.Contains(lowerBaseURL, "deepseek")
+}
+
+func defaultThinkingFieldMode(o *OpenAi, think bool) thinkingFieldMode {
+	if think {
+		return thinkingFieldEnabled
+	}
+	if shouldExplicitlyDisableThinking(o) {
+		return thinkingFieldDisabled
+	}
+	return thinkingFieldOmitted
+}
+
+func prepareMessagesForChatRequest(messages []map[string]interface{}, thinkingMode bool) []map[string]interface{} {
+	if thinkingMode {
+		return messages
+	}
+	return stripReasoningContent(messages)
+}
+
+func prepareMessagesForToolRequest(messages []map[string]interface{}, thinkingMode bool, depth int) []map[string]interface{} {
+	if thinkingMode {
+		return messages
+	}
+	if depth <= 0 {
+		return stripReasoningContent(messages)
+	}
+	if !hasReasoningContent(messages) {
+		return stripReasoningContent(messages)
+	}
+	return messages
+}
+
 func openAIHTTPErrorMessage(statusCode int, bodyBytes []byte) string {
 	bodyText := strings.TrimSpace(string(bodyBytes))
 	if bodyText == "" {
@@ -320,6 +367,10 @@ func shouldHandleToolCalls(finishReason string) bool {
 }
 
 func AskAi(o *OpenAi, err error, messages []map[string]interface{}, ch chan map[string]any, question string, think bool) {
+	askAiWithThinkingMode(o, err, messages, ch, question, think, defaultThinkingFieldMode(o, think))
+}
+
+func askAiWithThinkingMode(o *OpenAi, err error, messages []map[string]interface{}, ch chan map[string]any, question string, think bool, thinkingField thinkingFieldMode) {
 	if o.TimeOut <= 0 {
 		o.TimeOut = 300
 	}
@@ -335,14 +386,7 @@ func AskAi(o *OpenAi, err error, messages []map[string]interface{}, ch chan map[
 	baseURL, chatPath := openAIChatEndpoint(o.BaseUrl)
 	client.SetBaseURL(baseURL)
 
-	thinking := "disabled"
-	if think {
-		thinking = "enabled"
-	}
-
-	if !think {
-		messages = stripReasoningContent(messages)
-	}
+	messages = prepareMessagesForChatRequest(messages, think)
 
 	bodyMap := map[string]interface{}{
 		"model":    o.Model,
@@ -355,9 +399,9 @@ func AskAi(o *OpenAi, err error, messages []map[string]interface{}, ch chan map[
 	if o.MaxTokens > 0 {
 		bodyMap["max_tokens"] = o.MaxTokens
 	}
-	if think {
+	if thinkingField != thinkingFieldOmitted {
 		bodyMap["thinking"] = map[string]any{
-			"type": thinking,
+			"type": string(thinkingField),
 		}
 	}
 
@@ -388,19 +432,19 @@ func AskAi(o *OpenAi, err error, messages []map[string]interface{}, ch chan map[
 		bodyBytes, _ := io.ReadAll(body)
 		errMsg := openAIHTTPErrorMessage(resp.StatusCode(), bodyBytes)
 		logger.SugaredLogger.Errorf("Stream HTTP error %d: %s", resp.StatusCode(), errMsg)
-		if think && isUnsupportedThinkingError(errMsg) {
+		if thinkingField != thinkingFieldOmitted && isUnsupportedThinkingError(errMsg) {
 			logger.SugaredLogger.Warnf("Thinking is not supported by model %s, retrying without thinking", o.Model)
-			AskAi(o, err, stripReasoningContent(messages), ch, question, false)
+			askAiWithThinkingMode(o, err, stripReasoningContent(messages), ch, question, false, thinkingFieldOmitted)
 			return
 		}
 		if hasReasoningContent(messages) && isUnsupportedReasoningContentError(errMsg) {
 			logger.SugaredLogger.Warnf("reasoning_content is not supported by model %s, retrying without reasoning_content", o.Model)
-			AskAi(o, err, stripReasoningContent(messages), ch, question, think)
+			askAiWithThinkingMode(o, err, stripReasoningContent(messages), ch, question, think, thinkingField)
 			return
 		}
-		if resp.StatusCode() == 400 && think {
+		if resp.StatusCode() == 400 && thinkingField != thinkingFieldOmitted {
 			logger.SugaredLogger.Warnf("HTTP 400 with model %s, retrying without thinking", o.Model)
-			AskAi(o, err, stripReasoningContent(messages), ch, question, false)
+			askAiWithThinkingMode(o, err, stripReasoningContent(messages), ch, question, false, thinkingFieldOmitted)
 			return
 		}
 		ch <- map[string]any{
@@ -490,14 +534,14 @@ func AskAi(o *OpenAi, err error, messages []map[string]interface{}, ch chan map[
 					if res.Error.Message != "" {
 						msg = res.Error.Message
 					}
-					if think && isUnsupportedThinkingError(msg) {
+					if thinkingField != thinkingFieldOmitted && isUnsupportedThinkingError(msg) {
 						logger.SugaredLogger.Warnf("Thinking is not supported by model %s, retrying without thinking", o.Model)
-						AskAi(o, err, stripReasoningContent(messages), ch, question, false)
+						askAiWithThinkingMode(o, err, stripReasoningContent(messages), ch, question, false, thinkingFieldOmitted)
 						return
 					}
 					if hasReasoningContent(messages) && isUnsupportedReasoningContentError(msg) {
 						logger.SugaredLogger.Warnf("reasoning_content is not supported by model %s, retrying without reasoning_content", o.Model)
-						AskAi(o, err, stripReasoningContent(messages), ch, question, think)
+						askAiWithThinkingMode(o, err, stripReasoningContent(messages), ch, question, think, thinkingField)
 						return
 					}
 					ch <- map[string]any{
@@ -524,10 +568,14 @@ func AskAiWithTools(o *OpenAi, err error, messages []map[string]interface{}, ch 
 		AskAi(o, err, messages, ch, question, thinkingMode)
 		return
 	}
-	AskAiWithToolsDepth(o, err, messages, ch, question, tools, thinkingMode, 0)
+	askAiWithToolsDepthUsingThinkingMode(o, err, messages, ch, question, tools, thinkingMode, defaultThinkingFieldMode(o, thinkingMode), 0)
 }
 
 func AskAiWithToolsDepth(o *OpenAi, err error, messages []map[string]interface{}, ch chan map[string]any, question string, tools []Tool, thinkingMode bool, depth int) {
+	askAiWithToolsDepthUsingThinkingMode(o, err, messages, ch, question, tools, thinkingMode, defaultThinkingFieldMode(o, thinkingMode), depth)
+}
+
+func askAiWithToolsDepthUsingThinkingMode(o *OpenAi, err error, messages []map[string]interface{}, ch chan map[string]any, question string, tools []Tool, thinkingMode bool, thinkingField thinkingFieldMode, depth int) {
 	const maxDepth = 200
 	if depth > maxDepth {
 		logger.SugaredLogger.Warnf("AskAiWithTools max depth exceeded: %d", depth)
@@ -554,9 +602,7 @@ func AskAiWithToolsDepth(o *OpenAi, err error, messages []map[string]interface{}
 	baseURL, chatPath := openAIChatEndpoint(o.BaseUrl)
 	client.SetBaseURL(baseURL)
 
-	if !thinkingMode {
-		messages = stripReasoningContent(messages)
-	}
+	messages = prepareMessagesForToolRequest(messages, thinkingMode, depth)
 
 	bodyMap := map[string]interface{}{
 		"model":    o.Model,
@@ -570,14 +616,17 @@ func AskAiWithToolsDepth(o *OpenAi, err error, messages []map[string]interface{}
 	if o.MaxTokens > 0 {
 		bodyMap["max_tokens"] = o.MaxTokens
 	}
-	if thinkingMode {
+	if thinkingField != thinkingFieldOmitted {
 		bodyMap["thinking"] = map[string]any{
-			"type": "enabled",
+			"type": string(thinkingField),
 		}
 	}
 
 	reqBody, _ := json.Marshal(bodyMap)
-	if len(reqBody) > 100000 {
+	// Full Tools() schema is often 80–120KB alone; with messages the body routinely exceeds 100KB
+	// without being rejected by providers. Warn only at very large payloads.
+	const warnChatCompletionsBodyBytes = 512 * 1024
+	if len(reqBody) > warnChatCompletionsBodyBytes {
 		logger.SugaredLogger.Warnf("Request body too large: %d bytes, may cause API error", len(reqBody))
 	}
 
@@ -609,31 +658,31 @@ func AskAiWithToolsDepth(o *OpenAi, err error, messages []map[string]interface{}
 		errMsg := openAIHTTPErrorMessage(resp.StatusCode(), bodyBytes)
 		logger.SugaredLogger.Errorf("Stream HTTP error %d: %s", resp.StatusCode(), errMsg)
 
-		if thinkingMode && isUnsupportedThinkingError(errMsg) {
+		if thinkingField != thinkingFieldOmitted && isUnsupportedThinkingError(errMsg) {
 			logger.SugaredLogger.Warnf("Thinking is not supported by model %s, retrying tools request without thinking", o.Model)
-			AskAiWithToolsDepth(o, err, stripReasoningContent(messages), ch, question, tools, false, depth)
+			askAiWithToolsDepthUsingThinkingMode(o, err, stripReasoningContent(messages), ch, question, tools, false, thinkingFieldOmitted, depth)
 			return
 		}
 		if hasReasoningContent(messages) && isUnsupportedReasoningContentError(errMsg) {
 			logger.SugaredLogger.Warnf("reasoning_content is not supported by model %s, retrying tools request without reasoning_content", o.Model)
-			AskAiWithToolsDepth(o, err, stripReasoningContent(messages), ch, question, tools, thinkingMode, depth)
+			askAiWithToolsDepthUsingThinkingMode(o, err, stripReasoningContent(messages), ch, question, tools, thinkingMode, thinkingField, depth)
 			return
 		}
 		if isUnsupportedToolError(errMsg) {
 			logger.SugaredLogger.Warnf("Tools are not supported by model %s, retrying without tools", o.Model)
-			AskAi(o, err, stripToolMessages(messages), ch, question, thinkingMode)
+			askAiWithThinkingMode(o, err, stripToolMessages(messages), ch, question, thinkingMode, thinkingField)
 			return
 		}
 
 		if resp.StatusCode() == 400 {
-			if thinkingMode {
+			if thinkingField != thinkingFieldOmitted {
 				logger.SugaredLogger.Warnf("HTTP 400 with model %s, retrying without thinking (depth=%d)", o.Model, depth)
-				AskAiWithToolsDepth(o, err, stripReasoningContent(messages), ch, question, tools, false, depth)
+				askAiWithToolsDepthUsingThinkingMode(o, err, stripReasoningContent(messages), ch, question, tools, false, thinkingFieldOmitted, depth)
 				return
 			}
 			if len(tools) > 0 {
 				logger.SugaredLogger.Warnf("HTTP 400 with model %s, retrying without tools (depth=%d)", o.Model, depth)
-				AskAi(o, err, stripToolMessages(messages), ch, question, false)
+				askAiWithThinkingMode(o, err, stripToolMessages(messages), ch, question, false, thinkingFieldOmitted)
 				return
 			}
 		}
@@ -715,7 +764,7 @@ func AskAiWithToolsDepth(o *OpenAi, err error, messages []map[string]interface{}
 				fmt.Sprintf("工具 %s 不存在或未注册", call.Name),
 			)
 		}
-		AskAiWithToolsDepth(o, err, messages, ch, question, tools, thinkingMode, depth+1)
+		askAiWithToolsDepthUsingThinkingMode(o, err, messages, ch, question, tools, thinkingMode, thinkingField, depth+1)
 		return true
 	}
 
@@ -848,15 +897,15 @@ func AskAiWithToolsDepth(o *OpenAi, err error, messages []map[string]interface{}
 						msg = res.Error.Message
 					}
 
-					if thinkingMode && isUnsupportedThinkingError(msg) {
+					if thinkingField != thinkingFieldOmitted && isUnsupportedThinkingError(msg) {
 						logger.SugaredLogger.Warnf("Thinking is not supported by model %s, retrying tools request without thinking", o.Model)
-						AskAiWithToolsDepth(o, err, stripReasoningContent(messages), ch, question, tools, false, depth)
+						askAiWithToolsDepthUsingThinkingMode(o, err, stripReasoningContent(messages), ch, question, tools, false, thinkingFieldOmitted, depth)
 					} else if hasReasoningContent(messages) && isUnsupportedReasoningContentError(msg) {
 						logger.SugaredLogger.Warnf("reasoning_content is not supported by model %s, retrying tools request without reasoning_content", o.Model)
-						AskAiWithToolsDepth(o, err, stripReasoningContent(messages), ch, question, tools, thinkingMode, depth)
+						askAiWithToolsDepthUsingThinkingMode(o, err, stripReasoningContent(messages), ch, question, tools, thinkingMode, thinkingField, depth)
 					} else if isUnsupportedToolError(msg) {
 						logger.SugaredLogger.Warnf("Tools are not supported by model %s, retrying without tools", o.Model)
-						AskAi(o, err, stripToolMessages(messages), ch, question, thinkingMode)
+						askAiWithThinkingMode(o, err, stripToolMessages(messages), ch, question, thinkingMode, thinkingField)
 					} else {
 						ch <- map[string]any{
 							"code":     0,

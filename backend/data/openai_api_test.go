@@ -2,10 +2,76 @@ package data
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"go-stock/backend/db"
 	log "go-stock/backend/logger"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+func TestAskAiSendsDisabledThinkingForDeepSeekWhenThinkFalse(t *testing.T) {
+	var captured map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	o := NewOpenAiFromParams(context.TODO(), srv.URL, "test-key", "deepseek-v4-pro", 0.1, 256, 10, "", false, "")
+	AskAi(o, errors.New(""), []map[string]interface{}{
+		{"role": "user", "content": "hello"},
+	}, make(chan map[string]any, 1), "hello", false)
+
+	thinking, ok := captured["thinking"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected thinking field in request body, got: %#v", captured)
+	}
+	if got := thinking["type"]; got != "disabled" {
+		t.Fatalf("expected thinking.type=disabled, got %v", got)
+	}
+}
+
+func TestPrepareMessagesForToolRequestStripsBootstrapReasoningAtDepthZero(t *testing.T) {
+	msgs := []map[string]interface{}{
+		{"role": "assistant", "content": "bootstrap", "reasoning_content": "使用工具查询"},
+		{"role": "user", "content": "继续"},
+	}
+
+	got := prepareMessagesForToolRequest(msgs, false, 0)
+	if _, ok := got[0]["reasoning_content"]; ok {
+		t.Fatalf("expected depth 0 tool request to strip bootstrap reasoning_content, got %#v", got[0])
+	}
+}
+
+func TestPrepareMessagesForToolRequestKeepsRecursiveReasoningAtDepthOne(t *testing.T) {
+	msgs := []map[string]interface{}{
+		{"role": "assistant", "content": "tool call", "reasoning_content": "step-1"},
+		{"role": "tool", "content": "result", "tool_call_id": "call_1"},
+	}
+
+	got := prepareMessagesForToolRequest(msgs, false, 1)
+	if gotReasoning, ok := got[0]["reasoning_content"]; !ok || gotReasoning != "step-1" {
+		t.Fatalf("expected recursive tool request to preserve reasoning_content, got %#v", got[0])
+	}
+}
+
+func TestF10GenericToMarkdownOrderedHandlesNilResult(t *testing.T) {
+	got := f10GenericToMarkdownOrdered("测试标题", &F10GenericResp{}, f10LatestFinanceColOrder)
+	if got == "" {
+		t.Fatal("expected non-empty markdown for nil result")
+	}
+	if want := "暂无数据"; !strings.Contains(got, want) {
+		t.Fatalf("expected markdown to contain %q, got %q", want, got)
+	}
+}
 
 func TestNewDeepSeekOpenAiConfig(t *testing.T) {
 	db.Init("../../data/stock.db")

@@ -675,7 +675,7 @@ func (receiver StockDataApi) GetStockLatestFinanceToMarkdown(stockCode string) s
 		return fmt.Sprintf("获取最新财务数据失败: %v", err)
 	}
 	name := ""
-	if len(resp.Result.Data) > 0 {
+	if resp != nil && resp.Result != nil && len(resp.Result.Data) > 0 {
 		if n, ok := resp.Result.Data[0]["SECURITY_NAME_ABBR"].(string); ok {
 			name = n
 		}
