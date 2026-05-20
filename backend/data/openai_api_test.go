@@ -73,6 +73,26 @@ func TestF10GenericToMarkdownOrderedHandlesNilResult(t *testing.T) {
 	}
 }
 
+func TestAppendToolMessagesReusesAssistantMessageForSameTurn(t *testing.T) {
+	var messages []map[string]any
+
+	appendToolMessages(&messages, "partial answer", "reasoning", "call_1", "ToolA", `{"q":"a"}`, "result-a")
+	appendToolMessages(&messages, "partial answer", "reasoning", "call_2", "ToolB", `{"q":"b"}`, "result-b")
+
+	if len(messages) != 3 {
+		t.Fatalf("expected 3 messages (assistant + 2 tool), got %d", len(messages))
+	}
+
+	assistant := messages[0]
+	toolCalls, ok := assistant["tool_calls"].([]map[string]any)
+	if !ok {
+		t.Fatalf("expected assistant tool_calls to be []map[string]any, got %#v", assistant["tool_calls"])
+	}
+	if len(toolCalls) != 2 {
+		t.Fatalf("expected 2 tool calls on one assistant message, got %d", len(toolCalls))
+	}
+}
+
 func TestNewDeepSeekOpenAiConfig(t *testing.T) {
 	db.Init("../../data/stock.db")
 	InitAnalyzeSentiment()

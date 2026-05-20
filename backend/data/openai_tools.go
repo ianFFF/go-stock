@@ -87,26 +87,48 @@ func appendToolMessages(
 	messages *[]map[string]any,
 	currentAIContent, reasoningContent, callID, funcName, funcArgs, toolContent string,
 ) {
-	assistantMsg := map[string]any{
-		"role":    "assistant",
-		"content": currentAIContent,
-		"tool_calls": []map[string]any{
-			{
-				"id": callID,
-				//"tool_call_id": callID,
-				"type": "function",
-				"function": map[string]string{
-					"name":      funcName,
-					"arguments": funcArgs,
-					//"parameters": funcArgs,
-				},
-			},
+	toolCall := map[string]any{
+		"id": callID,
+		"type": "function",
+		"function": map[string]string{
+			"name":      funcName,
+			"arguments": funcArgs,
 		},
 	}
-	if reasoningContent != "" {
-		assistantMsg["reasoning_content"] = reasoningContent
+
+	reusedAssistant := false
+	for i := len(*messages) - 1; i >= 0; i-- {
+		msg := (*messages)[i]
+		role, _ := msg["role"].(string)
+		if role == "tool" {
+			continue
+		}
+		if role != "assistant" {
+			break
+		}
+		content, _ := msg["content"].(string)
+		existingReasoning, _ := msg["reasoning_content"].(string)
+		if content != currentAIContent || existingReasoning != reasoningContent {
+			break
+		}
+		if toolCalls, ok := msg["tool_calls"].([]map[string]any); ok {
+			msg["tool_calls"] = append(toolCalls, toolCall)
+			(*messages)[i] = msg
+			reusedAssistant = true
+		}
+		break
 	}
-	*messages = append(*messages, assistantMsg)
+	if !reusedAssistant {
+		assistantMsg := map[string]any{
+			"role":      "assistant",
+			"content":   currentAIContent,
+			"tool_calls": []map[string]any{toolCall},
+		}
+		if reasoningContent != "" {
+			assistantMsg["reasoning_content"] = reasoningContent
+		}
+		*messages = append(*messages, assistantMsg)
+	}
 
 	*messages = append(*messages, map[string]any{
 		"role":         "tool",
@@ -624,10 +646,22 @@ func askAiWithToolsDepthUsingThinkingMode(o *OpenAi, err error, messages []map[s
 
 	reqBody, _ := json.Marshal(bodyMap)
 	// Full Tools() schema is often 80–120KB alone; with messages the body routinely exceeds 100KB
-	// without being rejected by providers. Warn only at very large payloads.
+	// without being rejected by providers. Warn only at very large payloads, and hard-stop if
+	// tool recursion keeps inflating the request body beyond a practical upper bound.
 	const warnChatCompletionsBodyBytes = 512 * 1024
+	const maxChatCompletionsBodyBytes = 600 * 1024
 	if len(reqBody) > warnChatCompletionsBodyBytes {
-		logger.SugaredLogger.Warnf("Request body too large: %d bytes, may cause API error", len(reqBody))
+		logger.SugaredLogger.Warnf("Request body too large: %d bytes, may cause API error (depth=%d)", len(reqBody), depth)
+	}
+	if len(reqBody) > maxChatCompletionsBodyBytes {
+		msg := fmt.Sprintf("tools request body too large after recursive tool calls: %d bytes (depth=%d)", len(reqBody), depth)
+		logger.SugaredLogger.Errorf(msg)
+		ch <- map[string]any{
+			"code":     0,
+			"question": question,
+			"content":  msg,
+		}
+		return
 	}
 
 	req := client.R().
