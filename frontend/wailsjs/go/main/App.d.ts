@@ -110,6 +110,8 @@ export function GetAiConfigs():Promise<Array<data.AIConfig>>;
 
 export function GetAiRecommendStocksList(arg1:models.AiRecommendStocksQuery):Promise<models.AiRecommendStocksPageData>;
 
+export function GetAllBKCodes():Promise<Array<Record<string, string>>>;
+
 export function GetAllConcepts():Promise<Array<string>>;
 
 export function GetAllCustomStrategies():Promise<any>;
@@ -129,6 +131,14 @@ export function GetAllStockInfoById(arg1:number):Promise<models.AllStockInfo>;
 export function GetAllStockInfoList(arg1:data.AllStockInfoQuery):Promise<data.AllStockInfoPageData>;
 
 export function GetAllStocks(arg1:number,arg2:number,arg3:string,arg4:models.TechnicalIndicators):Promise<models.AllStocksResp>;
+
+export function GetBKFundFlowList(arg1:string,arg2:number):Promise<Array<models.BKFundFlowPoint>>;
+
+export function GetBKFundFlowListByDate(arg1:string,arg2:string):Promise<Array<models.BKFundFlowPoint>>;
+
+export function GetBKFundFlowTopList(arg1:number):Promise<Array<models.BKFundFlow>>;
+
+export function GetBKFundFlowTopListByDate(arg1:string,arg2:number):Promise<Array<models.BKFundFlow>>;
 
 export function GetChangeRank(arg1:number,arg2:number):Promise<data.ChangeRankResult>;
 
@@ -303,6 +313,8 @@ export function ReFleshTelegraphList(arg1:string):Promise<any>;
 export function RemoveGroup(arg1:number):Promise<string>;
 
 export function RemoveStockGroup(arg1:string,arg2:string,arg3:number):Promise<string>;
+
+export function RestartAsAdmin():Promise<void>;
 
 export function SaveAIResponseResult(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string,arg6:number):Promise<void>;
 

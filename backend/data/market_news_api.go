@@ -33,35 +33,56 @@ func NewMarketNewsApi() *MarketNewsApi {
 }
 
 func (m MarketNewsApi) TelegraphList(crawlTimeOut int64) *[]models.Telegraph {
-	//https://www.cls.cn/nodeapi/telegraphList
-	url := "https://www.cls.cn/nodeapi/telegraphList"
+	//https://www.cls.cn/api/cache?app=CailianpressWeb&name=telegraph&os=web&sv=8.7.9
+	clsURL := "https://www.cls.cn/api/cache?app=CailianpressWeb&name=telegraph&os=web&sv=8.7.9"
 	res := map[string]any{}
 	_, _ = SharedHTTPClient.SetTimeout(time.Duration(crawlTimeOut)*time.Second).R().
 		SetHeader("Referer", "https://www.cls.cn/").
-		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36 Edg/117.0.2045.60").
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0").
 		SetResult(&res).
-		Get(url)
+		Get(clsURL)
 	var telegraphs []models.Telegraph
 
-	if v, _ := convertor.ToInt(res["error"]); v == 0 {
+	if v, _ := convertor.ToInt(res["errno"]); v == 0 {
 		if res["data"] == nil {
-			return m.GetNewTelegraph(30)
+			return m.GetNewTelegraph(crawlTimeOut)
 		}
-		data := res["data"].(map[string]any)
-		rollData := data["roll_data"].([]any)
+		data, ok := res["data"].(map[string]any)
+		if !ok {
+			return m.GetNewTelegraph(crawlTimeOut)
+		}
+		rollData, ok := data["roll_data"].([]any)
+		if !ok || len(rollData) == 0 {
+			return m.GetNewTelegraph(crawlTimeOut)
+		}
 		for _, v := range rollData {
-			news := v.(map[string]any)
+			news, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
 			ctime, _ := convertor.ToInt(news["ctime"])
 			dataTime := time.Unix(ctime, 0).Local()
+
+			shareURL := ""
+			if su, ok2 := news["shareurl"].(string); ok2 && su != "" {
+				shareURL = su
+			} else if id, ok2 := news["id"]; ok2 {
+				shareURL = fmt.Sprintf("https://www.cls.cn/telegraph/%v", id)
+			}
+
+			title, _ := news["title"].(string)
+			content, _ := news["content"].(string)
+			level, _ := news["level"].(string)
+
 			telegraph := models.Telegraph{
-				Title:           news["title"].(string),
-				Content:         news["content"].(string),
+				Title:           title,
+				Content:         content,
 				Time:            dataTime.Format("15:04:05"),
 				DataTime:        &dataTime,
-				Url:             news["shareurl"].(string),
+				Url:             shareURL,
 				Source:          "财联社电报",
-				IsRed:           (news["level"].(string)) != "C",
-				SentimentResult: AnalyzeSentiment(news["content"].(string)).Description,
+				IsRed:           level != "C",
+				SentimentResult: AnalyzeSentiment(content).Description,
 			}
 			cnt := int64(0)
 			if telegraph.Title == "" {
@@ -74,13 +95,22 @@ func (m MarketNewsApi) TelegraphList(crawlTimeOut int64) *[]models.Telegraph {
 			}
 			telegraphs = append(telegraphs, telegraph)
 			db.Dao.Model(&models.Telegraph{}).Create(&telegraph)
-			////logger.SugaredLogger.Debugf("telegraph: %+v", &telegraph)
 			if news["subjects"] == nil {
 				continue
 			}
-			subjects := news["subjects"].([]any)
+			subjects, ok := news["subjects"].([]any)
+			if !ok {
+				continue
+			}
 			for _, subject := range subjects {
-				name := subject.(map[string]any)["subject_name"].(string)
+				subMap, ok := subject.(map[string]any)
+				if !ok {
+					continue
+				}
+				name, ok := subMap["subject_name"].(string)
+				if !ok || name == "" {
+					continue
+				}
 				tag := &models.Tags{
 					Name: name,
 					Type: "subject",
@@ -91,77 +121,104 @@ func (m MarketNewsApi) TelegraphList(crawlTimeOut int64) *[]models.Telegraph {
 					TagId:       tag.ID,
 				})
 			}
-
 		}
-		//db.Dao.Model(&models.Telegraph{}).Create(&telegraphs)
-		////logger.SugaredLogger.Debugf("telegraphs: %+v", &telegraphs)
+	} else {
+		return m.GetNewTelegraph(crawlTimeOut)
 	}
 
 	return &telegraphs
 }
 
 func (m MarketNewsApi) GetNewTelegraph(crawlTimeOut int64) *[]models.Telegraph {
-	url := "https://www.cls.cn/telegraph"
-	response, _ := SharedHTTPClient.SetTimeout(time.Duration(crawlTimeOut)*time.Second).R().
+	clsURL := "https://www.cls.cn/api/cache?app=CailianpressWeb&name=telegraphList&os=web&sv=8.7.9"
+	res := map[string]any{}
+	_, _ = SharedHTTPClient.SetTimeout(time.Duration(crawlTimeOut)*time.Second).R().
 		SetHeader("Referer", "https://www.cls.cn/").
-		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36 Edg/117.0.2045.60").
-		Get(url)
+		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0").
+		SetResult(&res).
+		Get(clsURL)
 	var telegraphs []models.Telegraph
-	//logger.SugaredLogger.Info(string(response.Body()))
-	document, _ := goquery.NewDocumentFromReader(strings.NewReader(string(response.Body())))
 
-	document.Find(".telegraph-content-box").Each(func(i int, selection *goquery.Selection) {
-		//logger.SugaredLogger.Info(selection.Text())
-		telegraph := models.Telegraph{Source: "财联社电报"}
-		spans := selection.Find("div.telegraph-content-box span")
-		if spans.Length() == 2 {
-			telegraph.Time = spans.First().Text()
-			telegraph.Content = spans.Last().Text()
-			if spans.Last().HasClass("c-de0422") {
-				telegraph.IsRed = true
-			}
+	if v, _ := convertor.ToInt(res["errno"]); v == 0 {
+		if res["data"] == nil {
+			return &telegraphs
 		}
+		data, ok := res["data"].(map[string]any)
+		if !ok {
+			return &telegraphs
+		}
+		rollData, ok := data["roll_data"].([]any)
+		if !ok {
+			return &telegraphs
+		}
+		for _, v := range rollData {
+			news, ok := v.(map[string]any)
+			if !ok {
+				continue
+			}
+			ctime, _ := convertor.ToInt(news["ctime"])
+			dataTime := time.Unix(ctime, 0).Local()
 
-		labels := selection.Find("div a.label-item")
-		labels.Each(func(i int, selection *goquery.Selection) {
-			if selection.HasClass("link-label-item") {
-				telegraph.Url = selection.AttrOr("href", "")
+			shareURL := ""
+			if su, ok2 := news["shareurl"].(string); ok2 && su != "" {
+				shareURL = su
+			} else if id, ok2 := news["id"]; ok2 {
+				shareURL = fmt.Sprintf("https://www.cls.cn/telegraph/%v", id)
+			}
+
+			title, _ := news["title"].(string)
+			content, _ := news["content"].(string)
+			level, _ := news["level"].(string)
+
+			telegraph := models.Telegraph{
+				Title:           title,
+				Content:         content,
+				Time:            dataTime.Format("15:04:05"),
+				DataTime:        &dataTime,
+				Url:             shareURL,
+				Source:          "财联社电报",
+				IsRed:           level != "C",
+				SentimentResult: AnalyzeSentiment(content).Description,
+			}
+			cnt := int64(0)
+			if telegraph.Title == "" {
+				db.Dao.Model(telegraph).Where("content=?", telegraph.Content).Count(&cnt)
 			} else {
+				db.Dao.Model(telegraph).Where("title=?", telegraph.Title).Count(&cnt)
+			}
+			if cnt > 0 {
+				continue
+			}
+			telegraphs = append(telegraphs, telegraph)
+			db.Dao.Model(&models.Telegraph{}).Create(&telegraph)
+			if news["subjects"] == nil {
+				continue
+			}
+			subjects, ok := news["subjects"].([]any)
+			if !ok {
+				continue
+			}
+			for _, subject := range subjects {
+				subMap, ok := subject.(map[string]any)
+				if !ok {
+					continue
+				}
+				name, ok := subMap["subject_name"].(string)
+				if !ok || name == "" {
+					continue
+				}
 				tag := &models.Tags{
-					Name: selection.Text(),
+					Name: name,
 					Type: "subject",
 				}
-				db.Dao.Model(tag).Where("name=? and type=?", selection.Text(), "subject").FirstOrCreate(&tag)
-				telegraph.SubjectTags = append(telegraph.SubjectTags, selection.Text())
+				db.Dao.Model(tag).Where("name=? and type=?", name, "subject").FirstOrCreate(&tag)
+				db.Dao.Model(models.TelegraphTags{}).Where("telegraph_id=? and tag_id=?", telegraph.ID, tag.ID).FirstOrCreate(&models.TelegraphTags{
+					TelegraphId: telegraph.ID,
+					TagId:       tag.ID,
+				})
 			}
-		})
-		stocks := selection.Find("div.telegraph-stock-plate-box a")
-		stocks.Each(func(i int, selection *goquery.Selection) {
-			telegraph.StocksTags = append(telegraph.StocksTags, selection.Text())
-		})
-
-		//telegraph = append(telegraph, ReplaceSensitiveWords(selection.Text()))
-		if telegraph.Content != "" {
-			telegraph.SentimentResult = AnalyzeSentiment(telegraph.Content).Description
-			cnt := int64(0)
-			db.Dao.Model(telegraph).Where("time=? and content=?", telegraph.Time, telegraph.Content).Count(&cnt)
-			if cnt == 0 {
-				db.Dao.Create(&telegraph)
-				telegraphs = append(telegraphs, telegraph)
-				for _, tag := range telegraph.SubjectTags {
-					tagInfo := &models.Tags{}
-					db.Dao.Model(models.Tags{}).Where("name=? and type=?", tag, "subject").First(&tagInfo)
-					if tagInfo.ID > 0 {
-						db.Dao.Model(models.TelegraphTags{}).Where("telegraph_id=? and tag_id=?", telegraph.ID, tagInfo.ID).FirstOrCreate(&models.TelegraphTags{
-							TelegraphId: telegraph.ID,
-							TagId:       tagInfo.ID,
-						})
-					}
-				}
-			}
-
 		}
-	})
+	}
 	return &telegraphs
 }
 func (m MarketNewsApi) GetNewsList(source string, limit int) *[]*models.Telegraph {
@@ -995,31 +1052,47 @@ func (m MarketNewsApi) TradingViewNewsDetail(id string) *models.TVNewsDetail {
 }
 
 func (m MarketNewsApi) XUEQIUHotStock(size int, marketType string) *[]models.HotItem {
-	cookieHeader, cookieErr := FetchXueqiuCookiesViaChromedp("", 30*time.Second, "https://xueqiu.com/hq#hot")
-	if cookieErr != nil {
-		logger.SugaredLogger.Warnf("雪球 chromedp 获取 cookie 失败: %v", cookieErr)
-	}
-
 	url := fmt.Sprintf("https://stock.xueqiu.com/v5/stock/hot_stock/list.json?page=1&size=%d&_type=%s&type=%s", size, marketType, marketType)
-	res := &models.XUEQIUHot{}
-	request := SharedHTTPClient.SetTimeout(time.Duration(30) * time.Second).R()
-	request.SetHeader("Host", "stock.xueqiu.com").
-		SetHeader("Origin", "https://xueqiu.com").
-		SetHeader("Referer", "https://xueqiu.com/").
-		SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0")
-	if cookieErr == nil && cookieHeader != "" {
-		request.SetHeader("Cookie", cookieHeader)
+	empty := &[]models.HotItem{}
+
+	const maxRetries = 2
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		cookieHeader, cookieErr := FetchXueqiuCookiesViaChromedp("", 30*time.Second, "https://xueqiu.com/hq#hot")
+		if cookieErr != nil {
+			logger.SugaredLogger.Warnf("雪球 chromedp 获取 cookie 失败 (attempt %d): %v", attempt+1, cookieErr)
+		}
+
+		res := &models.XUEQIUHot{}
+		request := SharedHTTPClient.SetTimeout(time.Duration(30) * time.Second).R()
+		request.SetHeader("Host", "stock.xueqiu.com").
+			SetHeader("Origin", "https://xueqiu.com").
+			SetHeader("Referer", "https://xueqiu.com/").
+			SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0")
+		if cookieErr == nil && cookieHeader != "" {
+			request.SetHeader("Cookie", cookieHeader)
+		}
+		_, err := request.SetResult(res).Get(url)
+		if err != nil {
+			logger.SugaredLogger.Errorf("XUEQIUHotStock err (attempt %d):%s", attempt+1, err.Error())
+			if attempt < maxRetries-1 {
+				InvalidateXueqiuCookieCache()
+				time.Sleep(time.Second)
+				continue
+			}
+			return empty
+		}
+		if res.ErrorCode != 0 {
+			logger.SugaredLogger.Errorf("XUEQIUHotStock API error (attempt %d): code=%d, desc=%s", attempt+1, res.ErrorCode, res.ErrorDescription)
+			if attempt < maxRetries-1 {
+				InvalidateXueqiuCookieCache()
+				time.Sleep(time.Second)
+				continue
+			}
+			return empty
+		}
+		return &res.Data.Items
 	}
-	_, err := request.SetResult(res).Get(url)
-	if err != nil {
-		logger.SugaredLogger.Errorf("XUEQIUHotStock err:%s", err.Error())
-		return &[]models.HotItem{}
-	}
-	if res.ErrorCode != 0 {
-		logger.SugaredLogger.Errorf("XUEQIUHotStock API error: code=%d, desc=%s", res.ErrorCode, res.ErrorDescription)
-		return &[]models.HotItem{}
-	}
-	return &res.Data.Items
+	return empty
 }
 
 func (m MarketNewsApi) HotEvent(size int) *[]models.HotEvent {

@@ -300,6 +300,7 @@ func AutoMigrate() {
 	db.Dao.AutoMigrate(&models.MCPServerTool{})
 	db.Dao.AutoMigrate(&models.Skill{})
 	db.Dao.AutoMigrate(&models.CustomStrategy{})
+	db.Dao.AutoMigrate(&models.BKFundFlow{})
 
 	//updateMultipleModel()
 

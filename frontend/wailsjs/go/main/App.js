@@ -210,6 +210,10 @@ export function GetAiRecommendStocksList(arg1) {
   return window['go']['main']['App']['GetAiRecommendStocksList'](arg1);
 }
 
+export function GetAllBKCodes() {
+  return window['go']['main']['App']['GetAllBKCodes']();
+}
+
 export function GetAllConcepts() {
   return window['go']['main']['App']['GetAllConcepts']();
 }
@@ -248,6 +252,22 @@ export function GetAllStockInfoList(arg1) {
 
 export function GetAllStocks(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['GetAllStocks'](arg1, arg2, arg3, arg4);
+}
+
+export function GetBKFundFlowList(arg1, arg2) {
+  return window['go']['main']['App']['GetBKFundFlowList'](arg1, arg2);
+}
+
+export function GetBKFundFlowListByDate(arg1, arg2) {
+  return window['go']['main']['App']['GetBKFundFlowListByDate'](arg1, arg2);
+}
+
+export function GetBKFundFlowTopList(arg1) {
+  return window['go']['main']['App']['GetBKFundFlowTopList'](arg1);
+}
+
+export function GetBKFundFlowTopListByDate(arg1, arg2) {
+  return window['go']['main']['App']['GetBKFundFlowTopListByDate'](arg1, arg2);
 }
 
 export function GetChangeRank(arg1, arg2) {
@@ -596,6 +616,10 @@ export function RemoveGroup(arg1) {
 
 export function RemoveStockGroup(arg1, arg2, arg3) {
   return window['go']['main']['App']['RemoveStockGroup'](arg1, arg2, arg3);
+}
+
+export function RestartAsAdmin() {
+  return window['go']['main']['App']['RestartAsAdmin']();
 }
 
 export function SaveAIResponseResult(arg1, arg2, arg3, arg4, arg5, arg6) {

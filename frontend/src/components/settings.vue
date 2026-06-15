@@ -523,7 +523,7 @@ function deletePrompt(ID) {
                   <div style="max-width: 400px;text-align: left">
                     获取方法：<br>
                     访问同花顺问财开放平台：<br>
-                    <a href="https://open.iwencai.com" target="_blank" style="color: #63e2b7">https://open.iwencai.com</a><br>
+                    <a href="https://open.iwencai.com" target="_blank" style="color: #63e2b7">https://www.iwencai.com/skillhub</a><br>
                     注册并登录后，在控制台获取API Key。<br>
                     配置后可使用问财智能选股、行情查询、研报搜索等功能。
                   </div>
@@ -544,7 +544,8 @@ function deletePrompt(ID) {
                   <n-gradient-text :type="'warning'">
                   <div style="max-width: 400px;text-align: left">
                     获取方法：<br>
-                    访问东方财富妙想AI平台获取API Key。<br>
+                    访问东方财富妙想AI平台获取API Key。
+                    https://ai.eastmoney.com/mxClaw<br>
                     配置后可使用个股业绩点评功能。
                   </div>
                   </n-gradient-text>

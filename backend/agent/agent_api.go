@@ -19,8 +19,9 @@ import (
 )
 
 type StockAiAgent struct {
-	instance  *AgentInstance
-	sessionID string
+	instance   *AgentInstance
+	sessionID  string
+	aiConfigId int
 }
 
 func NewStockAiAgentApi() *StockAiAgent {
@@ -65,8 +66,9 @@ func (receiver StockAiAgent) newStockAiAgent(ctx *context.Context, aiConfigId in
 	}
 
 	return &StockAiAgent{
-		instance:  agentInstance,
-		sessionID: sessionID,
+		instance:   agentInstance,
+		sessionID:  sessionID,
+		aiConfigId: aiConfigId,
 	}
 }
 
@@ -134,6 +136,15 @@ func (receiver StockAiAgent) ChatWithContext(ctx context.Context, question strin
 			sysPrompt = data.NewPromptTemplateApi().GetPromptTemplateByID(*sysPromptId)
 		}
 
+		sysPrompt += `
+
+【强制规则】你必须通过工具调用获取实时数据，严禁凭记忆编造或使用过时数据。以下场景必须调用工具：
+1. 股票/指数行情数据（价格、涨跌幅、成交量等）——必须调用工具获取最新实时数据
+2. 财务数据（营收、利润、市盈率等）——必须调用工具获取最新财报数据
+3. 新闻资讯——必须调用工具获取最新新闻
+4. 宏观经济数据——必须调用工具获取最新数据
+任何涉及具体数字的回答，都必须先通过工具查询确认，不得使用训练数据中的过时信息。如果你没有获取到最新数据，必须明确告知用户"当前未能获取到最新数据"，绝不能编造数据。`
+
 		settingConfig := data.GetSettingConfig()
 		aiConfig, _ := lo.Find(settingConfig.AiConfigs, func(item *data.AIConfig) bool {
 			return uint(aiConfigId) == item.ID
@@ -170,9 +181,11 @@ func (receiver StockAiAgent) ChatWithContext(ctx context.Context, question strin
 			}
 		}
 
+		messages = validateAndFixMessages(messages)
+
 		switch stockAiAgent.instance.Mode {
 		case AgentModePlanExecute:
-			runPlanExecuteWithFallback(ctx, stockAiAgent, messages, ch, memoryService, historyMessages, sysPrompt, question)
+			runPlanExecuteWithFallback(ctx, stockAiAgent, messages, ch, memoryService, historyMessages, sysPrompt, question, aiConfigId)
 		default:
 			runReact(ctx, stockAiAgent, messages, ch, memoryService, historyMessages, sysPrompt, question)
 		}
@@ -262,7 +275,9 @@ func runReact(ctx context.Context, stockAiAgent *StockAiAgent, messages []*schem
 				}
 			} else {
 				errMsg := fmt.Sprintf("❌ Agent 调用失败：%v", err)
-				if strings.Contains(err.Error(), "reasoning_content") || strings.Contains(err.Error(), "thinking is enabled") {
+				if strings.Contains(err.Error(), "exceeds max iterations") {
+					errMsg += "\n\n**可能原因**：模型在执行过程中进行了过多轮工具调用仍无法收敛，可能陷入了循环。\n\n**解决方案**：\n1. 尝试更精确地描述你的问题，减少模糊性\n2. 切换到支持更长上下文或更强推理能力的模型\n3. 简化查询条件"
+				} else if strings.Contains(err.Error(), "reasoning_content") || strings.Contains(err.Error(), "thinking is enabled") {
 					errMsg += "\n\n**可能原因**：当前模型开启了 thinking/reasoning 模式，但该模式与 Agent 工具调用不兼容。\n\n**解决方案**：请在 AI 配置中关闭 thinking 模式，或切换到支持工具调用的模型（如 deepseek-chat、gpt-4o 等）。"
 				}
 				ch <- &schema.Message{
@@ -313,11 +328,10 @@ func runReact(ctx context.Context, stockAiAgent *StockAiAgent, messages []*schem
 	wg.Wait()
 }
 
-func runPlanExecuteWithFallback(ctx context.Context, stockAiAgent *StockAiAgent, messages []*schema.Message, ch chan *schema.Message, memoryService *ChatMemoryService, historyMessages []*schema.Message, sysPrompt string, question string) {
+func runPlanExecuteWithFallback(ctx context.Context, stockAiAgent *StockAiAgent, messages []*schema.Message, ch chan *schema.Message, memoryService *ChatMemoryService, historyMessages []*schema.Message, sysPrompt string, question string, aiConfigId int) {
 	defer close(ch)
 
-	// 首先尝试 PlanExecute 模式
-	planExecuteSuccess := tryPlanExecute(ctx, stockAiAgent, messages, ch, memoryService)
+	planExecuteSuccess := tryPlanExecute(ctx, stockAiAgent, messages, ch, memoryService, aiConfigId)
 
 	if !planExecuteSuccess {
 		// 如果 PlanExecute 失败，降级到 React 模式
@@ -342,7 +356,7 @@ func runPlanExecuteWithFallback(ctx context.Context, stockAiAgent *StockAiAgent,
 	}
 }
 
-func tryPlanExecute(ctx context.Context, stockAiAgent *StockAiAgent, messages []*schema.Message, ch chan *schema.Message, memoryService *ChatMemoryService) bool {
+func tryPlanExecute(ctx context.Context, stockAiAgent *StockAiAgent, messages []*schema.Message, ch chan *schema.Message, memoryService *ChatMemoryService, aiConfigId int) bool {
 	adkAgent := stockAiAgent.instance.AdkAgent
 	if adkAgent == nil {
 		return false
@@ -376,36 +390,39 @@ func tryPlanExecute(ctx context.Context, stockAiAgent *StockAiAgent, messages []
 		if event.Err != nil {
 			logger.SugaredLogger.Errorf("agent event error: %v", event.Err)
 
-			// 检查是否是编码相关错误
 			if strings.Contains(event.Err.Error(), "unmarshal plan error") ||
 				strings.Contains(event.Err.Error(), "invalid char") ||
 				strings.Contains(event.Err.Error(), "UTF-8") {
 				logger.SugaredLogger.Warnf("检测到编码错误，触发降级机制")
-				return false // 触发降级
+				return false
 			}
 
-			// 处理 exceeds max steps 错误
-			if strings.Contains(event.Err.Error(), "exceeds max steps") || strings.Contains(event.Err.Error(), "exceeds max iterations") {
-				if fullResponse.Len() > 0 {
-					safeSend(ch, &schema.Message{
-						Role:    schema.Assistant,
-						Content: "\n\n---\n\n⚠️ **分析步骤已达上限，以下为已生成的部分分析结果：**\n\n",
-					})
-					safeSend(ch, &schema.Message{
-						Role:    schema.Assistant,
-						Content: fullResponse.String(),
-					})
-					return true
-				}
-				errMsg := "⚠️ 分析步骤已达上限，无法完成完整分析。\n\n**建议**：\n1. 简化问题，将复杂分析拆分成多个简单问题\n2. 在 AI 配置中尝试使用支持更长上下文的模型\n3. 减少对话历史或开启新对话"
+			if strings.Contains(event.Err.Error(), "no tool call") {
+				logger.SugaredLogger.Warnf("检测到模型未返回工具调用，使用OpenAI流式接口兜底")
 				safeSend(ch, &schema.Message{
-					Role:    schema.Assistant,
-					Content: errMsg,
+					Role:             schema.Assistant,
+					Content:          "",
+					ReasoningContent: "[STEP]⚠️ 当前工具调用失败，正在切换到标准模式继续分析...\n",
 				})
+				fallbackWithOpenAI(ctx, ch, messages, aiConfigId, &fullResponse)
 				return true
 			}
 
-			// 其他错误按正常处理
+			isMaxSteps := strings.Contains(event.Err.Error(), "exceeds max iterations") || strings.Contains(event.Err.Error(), "exceeds max steps")
+			isNodeError := strings.Contains(event.Err.Error(), "NodeRunError")
+			isCriticalTerminate := isMaxSteps || isNodeError
+
+			if isCriticalTerminate {
+				logger.SugaredLogger.Warnf("检测到模型终止任务(原因为: %s)，使用OpenAI流式接口兜底", event.Err.Error())
+				safeSend(ch, &schema.Message{
+					Role:             schema.Assistant,
+					Content:          "",
+					ReasoningContent: "[STEP]⚠️ 模型中途终止任务，正在切换到标准模式继续分析...\n",
+				})
+				fallbackWithOpenAI(ctx, ch, messages, aiConfigId, &fullResponse)
+				return true
+			}
+
 			errMsg := fmt.Sprintf("❌ Agent 调用失败：%v", event.Err)
 			if isTokenLimitError(event.Err) {
 				errMsg = "❌ Agent 调用失败（token 超限）：输入内容超过模型最大上下文长度限制。请尝试缩短对话历史或使用支持更长上下文的模型。"
@@ -418,7 +435,7 @@ func tryPlanExecute(ctx context.Context, stockAiAgent *StockAiAgent, messages []
 				Role:    schema.Assistant,
 				Content: errMsg,
 			})
-			return true // 非编码错误，不需要降级
+			return true
 		}
 
 		if event.Output != nil && event.Output.MessageOutput != nil {
@@ -602,30 +619,16 @@ func runPlanExecute(ctx context.Context, stockAiAgent *StockAiAgent, messages []
 		if event.Err != nil {
 			logger.SugaredLogger.Errorf("agent event error: %v", event.Err)
 
-			// 处理 exceeds max steps 错误
-			if strings.Contains(event.Err.Error(), "exceeds max steps") || strings.Contains(event.Err.Error(), "exceeds max iterations") {
-				if fullResponse.Len() > 0 {
-					safeSend(ch, &schema.Message{
-						Role:    schema.Assistant,
-						Content: "\n\n---\n\n⚠️ **分析步骤已达上限，以下为已生成的部分分析结果：**\n\n",
-					})
-					safeSend(ch, &schema.Message{
-						Role:    schema.Assistant,
-						Content: fullResponse.String(),
-					})
-				} else {
-					errMsg := "⚠️ 分析步骤已达上限，无法完成完整分析。\n\n**建议**：\n1. 简化问题，将复杂分析拆分成多个简单问题\n2. 在 AI 配置中尝试使用支持更长上下文的模型\n3. 减少对话历史或开启新对话"
-					safeSend(ch, &schema.Message{
-						Role:    schema.Assistant,
-						Content: errMsg,
-					})
-				}
-				continue
-			}
-
+			isMaxSteps := strings.Contains(event.Err.Error(), "exceeds max iterations") || strings.Contains(event.Err.Error(), "exceeds max steps")
 			errMsg := fmt.Sprintf("❌ Agent 调用失败：%v", event.Err)
 			if isTokenLimitError(event.Err) {
 				errMsg = "❌ Agent 调用失败（token 超限）：输入内容超过模型最大上下文长度限制。请尝试缩短对话历史或使用支持更长上下文的模型。"
+			} else if isMaxSteps {
+				if fullResponse.Len() > 0 {
+					errMsg = "\n---\n⚠️ **分析步骤已达上限，以下为已生成的部分分析结果：**\n\n"
+				} else {
+					errMsg = "❌ Agent 调用失败：分析步骤超过最大限制。\n\n**解决方案**：\n1. 尝试更精确地描述你的问题，减少模糊性\n2. 切换到支持更长上下文或更强推理能力的模型\n3. 简化查询条件"
+				}
 			} else if strings.Contains(event.Err.Error(), "reasoning_content") || strings.Contains(event.Err.Error(), "thinking is enabled") {
 				errMsg += "\n\n**可能原因**：当前模型开启了 thinking/reasoning 模式，但该模式与 Agent 工具调用不兼容。\n\n**解决方案**：请在 AI 配置中关闭 thinking 模式，或切换到支持工具调用的模型（如 deepseek-chat、gpt-4o 等）。"
 			} else if strings.Contains(event.Err.Error(), "unmarshal plan error") || strings.Contains(event.Err.Error(), "invalid char") {
@@ -635,6 +638,12 @@ func runPlanExecute(ctx context.Context, stockAiAgent *StockAiAgent, messages []
 				Role:    schema.Assistant,
 				Content: errMsg,
 			})
+			if isMaxSteps && fullResponse.Len() > 0 {
+				safeSend(ch, &schema.Message{
+					Role:    schema.Assistant,
+					Content: fullResponse.String(),
+				})
+			}
 			continue
 		}
 
@@ -872,53 +881,59 @@ func handleAdkMessage(msg *schema.Message, role schema.RoleType, toolName string
 	}
 
 	if msg.Content != "" && (role == schema.Assistant || msg.Role == schema.Assistant) {
-		cleanContent := stripPlanJSON(msg.Content)
-		if cleanContent != "" {
-			fullResponse.WriteString(cleanContent)
+		cleaned := stripPlanJSON(msg.Content)
+		if cleaned != "" {
+			fullResponse.WriteString(cleaned)
 			safeSend(ch, &schema.Message{
 				Role:    schema.Assistant,
-				Content: cleanContent,
+				Content: cleaned,
 			})
 		}
 	}
 }
 
 func stripPlanJSON(content string) string {
-	lines := strings.Split(content, "\n")
-	var filtered []string
-	inJSONBlock := false
-
-	for _, line := range lines {
+	if !strings.Contains(content, `"steps"`) {
+		return content
+	}
+	var b strings.Builder
+	b.Grow(len(content))
+	inCodeBlock := false
+	for _, line := range strings.Split(content, "\n") {
 		trimmed := strings.TrimSpace(line)
-
-		if strings.HasPrefix(trimmed, "```json") {
-			inJSONBlock = true
+		if strings.HasPrefix(trimmed, "```") {
+			inCodeBlock = !inCodeBlock
+		}
+		if inCodeBlock && strings.Contains(trimmed, `"steps"`) && strings.Contains(trimmed, "[") {
 			continue
 		}
-		if inJSONBlock && strings.HasPrefix(trimmed, "```") {
-			inJSONBlock = false
+		if !inCodeBlock && (strings.HasPrefix(trimmed, `{"steps":`) || strings.HasPrefix(trimmed, `{"steps" :`)) {
 			continue
 		}
-		if inJSONBlock {
-			if strings.Contains(trimmed, `"steps"`) {
-				continue
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+	}
+	result := strings.TrimRight(b.String(), "\n ")
+	if result == "" {
+		return ""
+	}
+	lines := strings.Split(result, "\n")
+	cleaned := make([]string, 0, len(lines))
+	skipEmpty := true
+	for _, l := range lines {
+		if strings.TrimSpace(l) == "" {
+			if !skipEmpty {
+				cleaned = append(cleaned, l)
 			}
-		}
-
-		if strings.HasPrefix(trimmed, "{") && strings.Contains(trimmed, `"steps"`) {
+			skipEmpty = true
 			continue
 		}
-
-		filtered = append(filtered, line)
+		skipEmpty = false
+		cleaned = append(cleaned, l)
 	}
-
-	result := strings.Join(filtered, "\n")
-
-	for strings.Contains(result, "\n\n\n") {
-		result = strings.ReplaceAll(result, "\n\n\n", "\n\n")
-	}
-
-	return strings.TrimSpace(result)
+	return strings.Join(cleaned, "\n")
 }
 
 func formatMarkdown(content string) string {
@@ -1031,4 +1046,150 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// validateAndFixMessages 验证并修复消息序列，确保兼容各类模型API的消息格式要求。
+// 处理：1)移除空消息 2)去除连续重复User消息 3)修复孤立的Tool消息 4)确保消息序列合法
+func validateAndFixMessages(messages []*schema.Message) []*schema.Message {
+	if len(messages) <= 1 {
+		return messages
+	}
+
+	// 1. 移除空消息
+	var cleaned []*schema.Message
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		if msg.Content == "" && len(msg.ToolCalls) == 0 && msg.ToolCallID == "" && msg.ReasoningContent == "" {
+			continue
+		}
+		cleaned = append(cleaned, msg)
+	}
+	if len(cleaned) <= 1 {
+		return cleaned
+	}
+
+	// 2. 合并连续User消息（保留最后一条），兼容要求严格 user/assistant 交替的模型
+	var deduped []*schema.Message
+	for _, msg := range cleaned {
+		if msg.Role == schema.User && len(deduped) > 0 && deduped[len(deduped)-1].Role == schema.User {
+			deduped[len(deduped)-1] = msg
+			continue
+		}
+		deduped = append(deduped, msg)
+	}
+
+	// 3. 移除开头孤立的Tool消息（没有对应Assistant ToolCall）
+	var result []*schema.Message
+	hasAssistantWithTools := false
+	for _, msg := range deduped {
+		if msg.Role == schema.Tool && !hasAssistantWithTools {
+			logger.SugaredLogger.Warnf("validateAndFixMessages: 跳过开头孤立的Tool消息 (toolCallID=%s)", msg.ToolCallID)
+			continue
+		}
+		if msg.Role == schema.Assistant && len(msg.ToolCalls) > 0 {
+			hasAssistantWithTools = true
+		}
+		result = append(result, msg)
+	}
+
+	if len(result) == 0 {
+		return messages
+	}
+	return result
+}
+
+func fallbackWithOpenAI(ctx context.Context, ch chan *schema.Message, messages []*schema.Message, aiConfigId int, fullResponse *strings.Builder) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.SugaredLogger.Errorf("panic in fallbackWithOpenAI: %v", r)
+			safeSend(ch, &schema.Message{
+				Role:    schema.Assistant,
+				Content: fmt.Sprintf("❌ 兜底模式也失败了: %v", r),
+			})
+		}
+	}()
+
+	oai := data.NewDeepSeekOpenAi(ctx, aiConfigId)
+	if oai == nil {
+		logger.SugaredLogger.Errorf("创建OpenAI实例失败, aiConfigId=%d", aiConfigId)
+		safeSend(ch, &schema.Message{
+			Role:    schema.Assistant,
+			Content: "❌ 兜底模式失败：无法创建AI实例",
+		})
+		return
+	}
+
+	var question string
+	chatMsgs := make([]map[string]interface{}, 0, len(messages)+2)
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		m := map[string]interface{}{
+			"role":    string(msg.Role),
+			"content": msg.Content,
+		}
+		if msg.Role == schema.User && msg.Content != "" {
+			question = msg.Content
+		}
+		chatMsgs = append(chatMsgs, m)
+	}
+
+	if question == "" {
+		question = "请分析"
+	}
+
+	if fullResponse != nil && fullResponse.Len() > 0 {
+		chatMsgs = append(chatMsgs, map[string]interface{}{
+			"role":    "assistant",
+			"content": "（之前的部分分析结果）\n" + fullResponse.String(),
+		})
+	}
+
+	chatMsgs = append(chatMsgs, map[string]interface{}{
+		"role":    "user",
+		"content": "请不要调用任何工具（function call），直接基于已有的上下文信息进行分析，用中文给出最终结论。如某些数据无法获取，请明确说明并给出建议。",
+	})
+
+	oiCh := make(chan map[string]any, 512)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.SugaredLogger.Errorf("panic in AskAi goroutine: %v", r)
+			}
+		}()
+		data.AskAi(oai, fmt.Errorf("agent fallback"), chatMsgs, oiCh, question, false)
+	}()
+
+	var fallbackResp strings.Builder
+	for item := range oiCh {
+		if item == nil {
+			continue
+		}
+		code, _ := item["code"].(float64)
+		if code == 0 {
+			content, _ := item["content"].(string)
+			if content != "" {
+				logger.SugaredLogger.Warnf("OpenAI兜底模式错误: %s", content)
+			}
+			continue
+		}
+		content, _ := item["content"].(string)
+		if content != "" {
+			fallbackResp.WriteString(content)
+			safeSend(ch, &schema.Message{
+				Role:    schema.Assistant,
+				Content: content,
+			})
+		}
+	}
+
+	if fallbackResp.Len() > 0 && fullResponse != nil {
+		if fullResponse.Len() > 0 {
+			fullResponse.WriteString("\n\n")
+		}
+		fullResponse.WriteString(fallbackResp.String())
+	}
 }

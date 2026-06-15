@@ -113,3 +113,36 @@ func CreateHTTPClientWithTimeout(timeout time.Duration) *resty.Client {
 		SetTimeout(timeout).
 		SetRetryCount(0)
 }
+
+func CreateDownloadClient() *resty.Client {
+	httpConfigMutex.RLock()
+	transport := sharedTransport
+	httpConfigMutex.RUnlock()
+
+	downloadTransport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          5,
+		MaxIdleConnsPerHost:   2,
+		MaxConnsPerHost:       2,
+		IdleConnTimeout:       120 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+		Proxy:                 transport.Proxy,
+	}
+
+	downloadHTTPClient := &http.Client{
+		Transport: downloadTransport,
+		Timeout:   0,
+	}
+
+	return resty.NewWithClient(downloadHTTPClient).
+		SetTimeout(0).
+		SetRetryCount(2).
+		SetRetryWaitTime(5 * time.Second).
+		SetRetryMaxWaitTime(30 * time.Second)
+}

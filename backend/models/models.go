@@ -1607,6 +1607,8 @@ type MCPServer struct {
 	Name        string    `json:"name" gorm:"size:255;not null"`
 	Description string    `json:"description" gorm:"size:500"`
 	URL         string    `json:"url" gorm:"size:500"`
+	Type        string    `json:"type" gorm:"size:20;default:streamable-http"`
+	Headers     string    `json:"headers" gorm:"type:text"`
 	Command     string    `json:"command" gorm:"size:500"`
 	Args        string    `json:"args" gorm:"type:text"`
 	Env         string    `json:"env" gorm:"type:text"`
@@ -1704,4 +1706,24 @@ type CustomStrategyPageData struct {
 	Page       int              `json:"page"`
 	PageSize   int              `json:"pageSize"`
 	TotalPages int              `json:"totalPages"`
+}
+
+// BKFundFlow 板块资金流向数据
+type BKFundFlow struct {
+	ID        uint      `json:"id" gorm:"primarykey"`
+	Code      string    `json:"code" gorm:"size:20;index:idx_bk_code_time"`     // 板块代码 BK0475
+	Name      string    `json:"name" gorm:"size:50"`                            // 板块名称
+	NetInflow int64     `json:"netInflow"`                                      // 主力净流入金额（元）
+	SnapTime  string    `json:"snapTime" gorm:"size:19;index:idx_bk_code_time"` // 快照时间 YYYY-MM-DD HH:MM:SS
+	CreatedAt time.Time `json:"createdAt" gorm:"autoCreateTime"`
+}
+
+func (BKFundFlow) TableName() string {
+	return "bk_fund_flow"
+}
+
+// BKFundFlowPoint 板块资金流向数据点（前端折线图用）
+type BKFundFlowPoint struct {
+	SnapTime  string `json:"snapTime"`
+	NetInflow int64  `json:"netInflow"`
 }

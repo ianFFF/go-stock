@@ -105,6 +105,7 @@ dist
 
 .DS_Store
 
+.qoder
 .idea/
 /data/*.db*
 ai-assistant-web/data/*.db*

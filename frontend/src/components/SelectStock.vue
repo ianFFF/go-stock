@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import {h, onBeforeMount, onMounted, onUnmounted, ref, reactive, computed} from 'vue'
-import {SearchStock, GetHotStrategy, OpenURL, Follow, GetFollowList, GetAllCustomStrategies, SaveCustomStrategy, DeleteCustomStrategy} from "../../wailsjs/go/main/App";
+import {SearchStock, GetHotStrategy, OpenURL, Follow, GetFollowList, GetAllCustomStrategies, SaveCustomStrategy, DeleteCustomStrategy, GetEffectiveSponsorVip, GetConfig} from "../../wailsjs/go/main/App";
 import {useMessage, NText, NTag, NButton, NPopconfirm} from 'naive-ui'
 import {Environment} from "../../wailsjs/runtime"
 import {BookmarkOutline, TrashOutline, CreateOutline, AddOutline} from "@vicons/ionicons5";
 import {EventsEmit} from "../../wailsjs/runtime";
+import StockLightweightKlineChart from "./StockLightweightKlineChart.vue";
 
 const message = useMessage()
 const search = ref('')
@@ -16,6 +17,12 @@ const traceInfo = ref('')
 const tableScrollX = ref(2800)
 const leftTab = ref('hot')
 const showSaveModal = ref(false)
+const vipLevel = ref(0)
+const darkTheme = ref(false)
+const klineModalShow = ref(false)
+const klineStockCode = ref('')
+const klineStockName = ref('')
+let klineAutoCloseTimer = null
 const saveForm = reactive({
   id: 0,
   name: '',
@@ -105,10 +112,20 @@ function Search() {
       columns.value.push({
         title: '操作',
         key: 'actions',
-        width: 80,
+        width: 130,
         fixed: 'right',
         render: (row) => {
-          return h(
+          return h('div', {style: 'display:flex;gap:4px;'}, [
+            h(
+              NButton,
+              {
+                size: 'tiny',
+                type: 'info',
+                onClick: () => showStockKline(row)
+              },
+              {default: () => 'K线'}
+            ),
+            h(
               NButton,
               {
                 strong: true,
@@ -119,7 +136,8 @@ function Search() {
                 onClick: () => handleFollow(row)
               },
               {default: () => '关注'}
-          )
+            )
+          ])
         }
       });
       dataList.value = res.data.result.dataList
@@ -134,6 +152,48 @@ function Search() {
     }
   }).catch(err => {
     message.error(err)
+  })
+}
+
+function refreshEffectiveVip() {
+  return GetEffectiveSponsorVip().then(res => {
+    if (res) {
+      vipLevel.value = res.vipLevel || 0
+    }
+  }).catch(() => {})
+}
+
+function toEastMoneyCode(stockCode, marketShortName) {
+  const m = (marketShortName || '').toUpperCase()
+  if (m === 'SH' || m === 'SZ' || m === 'BJ') return stockCode + '.' + m
+  if (m === 'HK') return stockCode + '.HK'
+  if (/^(6|5)/.test(stockCode)) return stockCode + '.SH'
+  if (/^(8|4)/.test(stockCode)) return stockCode + '.BJ'
+  return stockCode + '.SZ'
+}
+
+function showStockKline(row) {
+  const stockCode = row.SECURITY_CODE
+  const stockName = row.SECURITY_SHORT_NAME
+  const em = toEastMoneyCode(stockCode, row.MARKET_SHORT_NAME)
+  if (!em) {
+    message.warning('当前代码暂不支持K线图')
+    return
+  }
+  refreshEffectiveVip().then(() => {
+    klineStockCode.value = em
+    klineStockName.value = stockName || ''
+    if (vipLevel.value < 2) {
+      message.warning('K线图仅限 VIP2 及以上用户使用，您当前权限不足，将在 10 秒后自动关闭')
+      klineModalShow.value = true
+      if (klineAutoCloseTimer) clearTimeout(klineAutoCloseTimer)
+      klineAutoCloseTimer = setTimeout(() => {
+        klineModalShow.value = false
+      }, 10000)
+      return
+    }
+    klineModalShow.value = true
+    if (klineAutoCloseTimer) clearTimeout(klineAutoCloseTimer)
   })
 }
 
@@ -153,6 +213,9 @@ function isNumeric(value) {
 }
 
 onBeforeMount(() => {
+  GetConfig().then(result => {
+    if (result.darkTheme) darkTheme.value = true
+  })
   GetHotStrategy().then(res => {
     if (res.code == 1) {
       hotStrategy.value = res.data
@@ -392,6 +455,23 @@ function openCenteredWindow(url, width, height) {
         <n-input v-model:value="saveForm.description" type="textarea" :rows="2" placeholder="可选，对策略的简要说明"/>
       </n-form-item>
     </n-form>
+  </n-modal>
+
+  <n-modal
+    v-model:show="klineModalShow"
+    :title="(klineStockName || '') + ' - ' + klineStockCode + ' K线图'"
+    preset="card"
+    style="width: 1400px;max-width: calc(100vw - 32px);"
+    :mask-closable="true"
+  >
+    <StockLightweightKlineChart
+      v-if="klineModalShow && klineStockCode"
+      :key="klineStockCode"
+      :code="klineStockCode"
+      :stock-name="klineStockName"
+      :dark-theme="darkTheme"
+      :chart-height="460"
+    />
   </n-modal>
 </template>
 

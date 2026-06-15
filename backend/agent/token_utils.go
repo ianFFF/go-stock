@@ -148,54 +148,11 @@ func trimToolResult(content string, maxTokens int) string {
 }
 
 func compressMessages(messages []*schema.Message, maxTokens int) []*schema.Message {
-	if len(messages) == 0 {
+	if maxTokens <= 0 || len(messages) == 0 {
 		return messages
 	}
-
-	currentTokens := estimateMessagesTokens(messages)
-	if currentTokens <= maxTokens {
-		return messages
-	}
-
-	logger.SugaredLogger.Infof("MessageRewriter: 上下文压缩前 %d 条消息, 估算 %d tokens, 预算 %d tokens",
-		len(messages), currentTokens, maxTokens)
-
-	result := make([]*schema.Message, 0, len(messages))
-
-	var systemMsgs []*schema.Message
-	var nonSystemMsgs []*schema.Message
-	for _, msg := range messages {
-		if msg.Role == schema.System {
-			systemMsgs = append(systemMsgs, msg)
-		} else {
-			nonSystemMsgs = append(nonSystemMsgs, msg)
-		}
-	}
-
-	result = append(result, systemMsgs...)
-	systemTokens := estimateMessagesTokens(systemMsgs)
-
-	remainingBudget := maxTokens - systemTokens
-	if remainingBudget <= 0 {
-		logger.SugaredLogger.Warnf("MessageRewriter: 系统消息已超出预算, 仅保留系统消息")
-		return result
-	}
-
-	compressed := compressNonSystemMessages(nonSystemMsgs, remainingBudget)
-	result = append(result, compressed...)
-
-	result = validateAndFixMessageSequence(result)
-
-	finalTokens := estimateMessagesTokens(result)
-	logger.SugaredLogger.Infof("MessageRewriter: 上下文压缩后 %d 条消息, 估算 %d tokens (节省 %d tokens)",
-		len(result), finalTokens, currentTokens-finalTokens)
-
-	for i, msg := range result {
-		logger.SugaredLogger.Debugf("  [%d] role=%s contentLen=%d toolCalls=%d toolCallID=%s",
-			i, msg.Role, len(msg.Content), len(msg.ToolCalls), msg.ToolCallID)
-	}
-
-	return result
+	compressed := compressNonSystemMessages(messages, maxTokens)
+	return validateAndFixMessages(compressed)
 }
 
 func validateAndFixMessageSequence(messages []*schema.Message) []*schema.Message {
@@ -254,25 +211,23 @@ func compressNonSystemMessages(messages []*schema.Message, maxTokens int) []*sch
 		return messages
 	}
 
-	trimmed := trimLargeToolResults(messages, 4000)
-
-	currentTokens := estimateMessagesTokens(trimmed)
+	currentTokens := estimateMessagesTokens(messages)
 	if currentTokens <= maxTokens {
-		return trimmed
+		return messages
 	}
 
 	var userMsg *schema.Message
 	var afterUser []*schema.Message
-	for i, msg := range trimmed {
+	for i, msg := range messages {
 		if msg.Role == schema.User {
 			userMsg = msg
-			afterUser = trimmed[i+1:]
+			afterUser = messages[i+1:]
 			break
 		}
 	}
 
 	if userMsg == nil {
-		return dropOldestMessages(trimmed, maxTokens)
+		return dropOldestMessages(messages, maxTokens)
 	}
 
 	userTokens := estimateTokens(userMsg.Content) + 4
@@ -281,50 +236,32 @@ func compressNonSystemMessages(messages []*schema.Message, maxTokens int) []*sch
 		afterUserBudget = 0
 	}
 
-	compressedAfterUser := dropToolCallGroups(afterUser, afterUserBudget)
-
-	result := make([]*schema.Message, 0, len(compressedAfterUser)+1)
-	result = append(result, userMsg)
-	result = append(result, compressedAfterUser...)
-	return result
-}
-
-func dropToolCallGroups(messages []*schema.Message, maxTokens int) []*schema.Message {
-	if len(messages) == 0 {
-		return messages
-	}
-
-	type toolGroup struct {
-		messages []*schema.Message
-		tokens   int
-	}
 	var groups []toolGroup
 
 	i := 0
-	for i < len(messages) {
-		msg := messages[i]
+	for i < len(afterUser) {
+		msg := afterUser[i]
 		if msg.Role == schema.Assistant && len(msg.ToolCalls) > 0 {
 			groupTokens := estimateTokens(msg.Content) + 4
 			for _, tc := range msg.ToolCalls {
 				groupTokens += estimateTokens(tc.Function.Name) + estimateTokens(tc.Function.Arguments)
 			}
-
 			var groupMsgs []*schema.Message
 			groupMsgs = append(groupMsgs, msg)
 
 			j := i + 1
-			for j < len(messages) {
-				if messages[j].Role == schema.Tool {
+			for j < len(afterUser) {
+				if afterUser[j].Role == schema.Tool {
 					matched := false
 					for _, tc := range msg.ToolCalls {
-						if messages[j].ToolCallID == tc.ID {
+						if afterUser[j].ToolCallID == tc.ID {
 							matched = true
 							break
 						}
 					}
 					if matched {
-						groupMsgs = append(groupMsgs, messages[j])
-						groupTokens += estimateTokens(messages[j].Content) + 4
+						groupMsgs = append(groupMsgs, afterUser[j])
+						groupTokens += estimateTokens(afterUser[j].Content) + 4
 						j++
 						continue
 					}
@@ -332,9 +269,9 @@ func dropToolCallGroups(messages []*schema.Message, maxTokens int) []*schema.Mes
 				break
 			}
 
-			if j < len(messages) && messages[j].Role == schema.Assistant && messages[j].Content != "" && len(messages[j].ToolCalls) == 0 {
-				groupMsgs = append(groupMsgs, messages[j])
-				groupTokens += estimateTokens(messages[j].Content) + 4
+			if j < len(afterUser) && afterUser[j].Role == schema.Assistant && afterUser[j].Content != "" && len(afterUser[j].ToolCalls) == 0 {
+				groupMsgs = append(groupMsgs, afterUser[j])
+				groupTokens += estimateTokens(afterUser[j].Content) + 4
 				j++
 			}
 
@@ -347,50 +284,175 @@ func dropToolCallGroups(messages []*schema.Message, maxTokens int) []*schema.Mes
 		}
 	}
 
-	totalTokens := 0
+	totalAfterUser := 0
 	for _, g := range groups {
-		totalTokens += g.tokens
-	}
-	if totalTokens <= maxTokens {
-		return messages
+		totalAfterUser += g.tokens
 	}
 
-	startIdx := 0
-	for startIdx < len(groups) {
-		partialTokens := 0
-		for k := startIdx; k < len(groups); k++ {
-			partialTokens += groups[k].tokens
+	if totalAfterUser <= afterUserBudget {
+		result := make([]*schema.Message, 0, len(afterUser)+1)
+		result = append(result, userMsg)
+		result = append(result, afterUser...)
+		return result
+	}
+
+	overBudget := totalAfterUser - afterUserBudget
+	return progressiveCompressGroups(userMsg, groups, afterUserBudget, overBudget)
+}
+
+func progressiveCompressGroups(userMsg *schema.Message, groups []toolGroup, budget int, overBudget int) []*schema.Message {
+	n := len(groups)
+	if n == 0 {
+		result := []*schema.Message{userMsg}
+		return result
+	}
+
+	groupTokens := make([]int, n)
+	for i, g := range groups {
+		groupTokens[i] = g.tokens
+	}
+
+	totalTokens := 0
+	for _, t := range groupTokens {
+		totalTokens += t
+	}
+
+	compressed := make([]bool, n)
+	compressedGroupTokens := make([]int, n)
+	copy(compressedGroupTokens, groupTokens)
+
+	const (
+		recentWindow = 2
+		minToolBytes = 600
+	)
+
+	round := 0
+	for totalTokens > budget {
+		round++
+		improved := false
+
+		for i := 0; i < n; i++ {
+			if totalTokens <= budget {
+				break
+			}
+
+			distanceFromEnd := n - 1 - i
+			isRecent := distanceFromEnd < recentWindow
+
+			var maxBytes int
+			var threshold int
+			if isRecent {
+				maxBytes = 8000
+				threshold = 2000
+			} else if distanceFromEnd < recentWindow+2 {
+				maxBytes = 4000
+				threshold = 1000
+			} else {
+				maxBytes = 2000
+				threshold = 300
+			}
+
+			if compressed[i] && compressedGroupTokens[i] <= threshold {
+				continue
+			}
+
+			oldTokens := compressedGroupTokens[i]
+			newTokens := oldTokens
+			for _, msg := range groups[i].messages {
+				if msg.Role == schema.Tool && estimateTokens(msg.Content) > threshold {
+					currentBytes := len([]byte(msg.Content))
+					targetBytes := maxBytes
+					if !isRecent && round > 1 {
+						targetBytes = minToolBytes
+					}
+
+					if currentBytes > targetBytes {
+						compressedContent := smartContentCompress(msg.Content, targetBytes)
+						newEstimate := oldTokens - estimateTokens(msg.Content) + estimateTokens(compressedContent)
+						if newEstimate < oldTokens {
+							newTokens = newEstimate
+						}
+					}
+				}
+			}
+
+			if newTokens >= oldTokens {
+				compressed[i] = true
+				continue
+			}
+
+			saved := oldTokens - newTokens
+			totalTokens -= saved
+			compressedGroupTokens[i] = newTokens
+			compressed[i] = true
+			improved = true
 		}
-		if partialTokens <= maxTokens {
-			break
+
+		if !improved {
+			startIdx := 0
+			for startIdx < n {
+				partial := 0
+				for k := startIdx; k < n; k++ {
+					partial += compressedGroupTokens[k]
+				}
+				if partial <= budget {
+					break
+				}
+				startIdx++
+			}
+			if startIdx >= n {
+				startIdx = n - 1
+			}
+
+			result := []*schema.Message{userMsg}
+			for k := startIdx; k < n; k++ {
+				result = append(result, groups[k].messages...)
+			}
+			return result
 		}
-		startIdx++
 	}
 
-	if startIdx >= len(groups) {
-		startIdx = len(groups) - 1
-	}
-
-	var result []*schema.Message
-	for k := startIdx; k < len(groups); k++ {
-		result = append(result, groups[k].messages...)
+	result := []*schema.Message{userMsg}
+	for i, g := range groups {
+		if compressedGroupTokens[i] < groupTokens[i] {
+			rebuilt := rebuildCompressedGroup(g, compressedGroupTokens[i])
+			result = append(result, rebuilt...)
+		} else {
+			result = append(result, g.messages...)
+		}
 	}
 	return result
 }
 
-func trimLargeToolResults(messages []*schema.Message, maxToolResultTokens int) []*schema.Message {
-	result := make([]*schema.Message, len(messages))
-	for i, msg := range messages {
-		if msg.Role == schema.Tool && estimateTokens(msg.Content) > maxToolResultTokens {
-			compressed := trimToolResult(msg.Content, maxToolResultTokens)
-			cp := *msg
-			cp.Content = compressed
-			result[i] = &cp
-		} else {
-			result[i] = msg
+func rebuildCompressedGroup(g toolGroup, targetTokens int) []*schema.Message {
+	result := make([]*schema.Message, len(g.messages))
+	for i, msg := range g.messages {
+		if msg.Role == schema.Tool {
+			msgTokens := estimateTokens(msg.Content)
+			if msgTokens > 500 {
+				currentBytes := len([]byte(msg.Content))
+				ratio := float64(targetTokens) / float64(g.tokens)
+				targetBytes := int(float64(currentBytes) * ratio)
+				if targetBytes < 600 {
+					targetBytes = 600
+				}
+				if targetBytes < currentBytes {
+					compressed := smartContentCompress(msg.Content, targetBytes)
+					cp := *msg
+					cp.Content = compressed + "\n\n[以上数据已智能压缩，保留了关键指标和结论]"
+					result[i] = &cp
+					continue
+				}
+			}
 		}
+		result[i] = msg
 	}
 	return result
+}
+
+type toolGroup struct {
+	messages []*schema.Message
+	tokens   int
 }
 
 func dropOldestMessages(messages []*schema.Message, maxTokens int) []*schema.Message {

@@ -22,6 +22,7 @@ import {
   OpenURL,
   RemoveGroup,
   RemoveStockGroup,
+  RestartAsAdmin,
   SaveAIResponseResult,
   SaveAsMarkdown,
   SaveImage,
@@ -161,11 +162,13 @@ const data = reactive({
   airesult: "",
   openAiEnable: false,
   loading: true,
+  analysisStatus: "",
   enableDanmu: false,
   darkTheme: false,
   changePercent: 0
 })
 const feishiInterval = ref(null)
+const aiAnalysisTimeout = ref(null)
 
 
 const currentGroupId = ref(0)
@@ -315,22 +318,17 @@ function handleTabDragEnd(event) {
 onBeforeMount(() => {
   GetGroupList().then(result => {
     groupList.value = result
-    // 检查是否存在相同的序号
     const sorts = result.map(item => item.sort);
     const uniqueSorts = new Set(sorts);
-    // 如果存在重复的序号，则重新初始化序号
     if (sorts.length !== uniqueSorts.size) {
-      // 调用InitializeGroupSort重新初始化序号
-      // 然后重新获取分组列表
       fetchGroupList();
     } else {
-      // 没有重复序号，继续正常流程
       if (route.query.groupId) {
         message.success("切换分组:" + route.query.groupName)
         currentGroupId.value = Number(route.query.groupId)
       }
     }
-  })
+  }).catch(err => { console.error("GetGroupList error:", err) })
   GetStockList("").then(result => {
     stockList.value = result
     options.value = result.map(item => {
@@ -339,7 +337,7 @@ onBeforeMount(() => {
         value: item.ts_code
       }
     })
-  })
+  }).catch(err => { console.error("GetStockList error:", err) })
   GetConfig().then(result => {
     if (result.openAiEnable) {
       data.openAiEnable = true
@@ -350,19 +348,21 @@ onBeforeMount(() => {
     if (result.darkTheme) {
       data.darkTheme = true
     }
-  })
+  }).catch(err => { console.error("GetConfig error:", err) })
   GetPromptTemplates("", "").then(res => {
     promptTemplates.value = res
 
     sysPromptOptions.value = promptTemplates.value.filter(item => item.type === '模型系统Prompt')
     userPromptOptions.value = promptTemplates.value.filter(item => item.type === '模型用户Prompt')
 
-  })
+  }).catch(err => { console.error("GetPromptTemplates error:", err) })
 
   GetAiConfigs().then(res => {
     aiConfigs.value = res
-    data.aiConfigId = res[0].ID
-  })
+    if (res && res.length > 0) {
+      data.aiConfigId = res[0].ID
+    }
+  }).catch(err => { console.error("GetAiConfigs error:", err) })
 
   EventsOn("loadingDone", (data) => {
     message.loading("刷新股票基础数据...")
@@ -396,10 +396,23 @@ onBeforeMount(() => {
 
   EventsOn("newChatStream", async (msg) => {
     if (msg === "DONE") {
+      // 清除超时定时器
+      if (aiAnalysisTimeout.value) {
+        clearTimeout(aiAnalysisTimeout.value)
+        aiAnalysisTimeout.value = null
+      }
       SaveAIResponseResult(data.code, data.name, data.airesult, data.chatId, data.question, data.aiConfigId)
-      message.info("AI分析完成！")
-      message.destroyAll()
       data.loading = false
+      data.analysisStatus = "分析完成"
+      message.destroyAll()
+      notify.success({
+        title: 'AI分析完成',
+        content: `[${data.name}] 分析已完成`,
+        duration: 3000,
+      })
+      setTimeout(() => {
+        data.analysisStatus = ""
+      }, 3000)
     } else {
       if (msg.chatId) {
         data.chatId = msg.chatId
@@ -408,6 +421,9 @@ onBeforeMount(() => {
         data.question = msg.question
       }
       if (msg.content || msg.reasoning_content || msg.extraContent) {
+        if (!data.airesult) {
+          data.analysisStatus = "AI正在分析中..."
+        }
         data.loading = false
       }
       if (msg.content) {
@@ -476,6 +492,36 @@ onBeforeMount(() => {
             })
           }
         }, {default: () => '查看'})
+      }
+    })
+  })
+
+  EventsOn("updateNeedAdmin", (msg) => {
+    notify.warning({
+      avatar: () =>
+          h(NAvatar, {
+            size: 'small',
+            round: false,
+            src: icon.value
+          }),
+      title: '更新需要管理员权限',
+      content: () => {
+        return h('div', {
+          style: {
+            'text-align': 'left',
+            'font-size': '14px',
+          }
+        }, { default: () => '新版本 ' + (msg.version || '') + ' 下载完成，但自动替换文件需要管理员权限。请以管理员身份重启程序后再次检查更新。' })
+      },
+      duration: 15000,
+      action: () => {
+        return h(NButton, {
+          type: 'warning',
+          size: 'small',
+          onClick: () => {
+            RestartAsAdmin()
+          }
+        }, { default: () => '以管理员身份重启' })
       }
     })
   })
@@ -618,6 +664,11 @@ onBeforeUnmount(() => {
   message.destroyAll()
   notify.destroyAll()
   clearInterval(feishiInterval.value)
+  // 清理 AI 分析超时定时器
+  if (aiAnalysisTimeout.value) {
+    clearTimeout(aiAnalysisTimeout.value)
+    aiAnalysisTimeout.value = null
+  }
   // 清理多周期 K 线自动关闭定时器
   if (klineAutoCloseTimer.value) {
     clearTimeout(klineAutoCloseTimer.value)
@@ -631,6 +682,7 @@ onBeforeUnmount(() => {
   EventsOff("newChatStream")
   EventsOff("changeTab")
   EventsOff("updateVersion")
+  EventsOff("updateNeedAdmin")
   EventsOff("warnMsg")
   EventsOff("loadingDone")
 
@@ -1860,6 +1912,15 @@ function checkPriceLineAlerts(result) {
 }
 
 function aiReCheckStock(stock, stockCode) {
+  if (!data.aiConfigId) {
+    message.error("请先选择AI模型配置")
+    return
+  }
+  // 清除之前的超时定时器
+  if (aiAnalysisTimeout.value) {
+    clearTimeout(aiAnalysisTimeout.value)
+    aiAnalysisTimeout.value = null
+  }
   data.modelName = ""
   data.airesult = ""
   data.time = ""
@@ -1867,6 +1928,7 @@ function aiReCheckStock(stock, stockCode) {
   data.code = stockCode
   data.loading = true
   modalShow4.value = true
+  data.analysisStatus = "正在连接AI服务..."
   message.loading("ai检测中...", {
     duration: 0,
   })
@@ -1874,6 +1936,28 @@ function aiReCheckStock(stock, stockCode) {
 
   //message.info("sysPromptId:"+data.sysPromptId)
   NewChatStream(stock, stockCode, data.question, data.aiConfigId, data.sysPromptId, enableTools.value,thinkingMode.value)
+    .catch(err => {
+      data.loading = false
+      data.analysisStatus = ""
+      message.destroyAll()
+      const errMsg = err?.message || err || "未知错误"
+      message.error("AI分析请求失败: " + errMsg)
+      data.airesult = "❌ AI分析请求失败: " + errMsg
+    })
+
+  // 设置超时兜底（5分钟）
+  aiAnalysisTimeout.value = setTimeout(() => {
+    if (data.loading) {
+      data.loading = false
+      data.analysisStatus = ""
+      message.destroyAll()
+      message.error("AI分析超时，请检查网络连接或AI服务配置")
+      if (!data.airesult) {
+        data.airesult = "❌ AI分析超时，请检查网络连接或AI服务配置是否正确。"
+      }
+    }
+    aiAnalysisTimeout.value = null
+  }, 5 * 60 * 1000)
 }
 
 function aiCheckStock(stock, stockCode) {
@@ -2717,7 +2801,7 @@ watch(modalShow6, (newVal) => {
 
   <n-modal transform-origin="center" v-model:show="modalShow4" preset="card" style="width: 800px;max-width: calc(100vw - 32px);"
            :title="'['+data.name+']AI分析'">
-    <n-spin size="small" :show="data.loading">
+    <n-spin size="small" :show="data.loading && !data.airesult">
       <MdEditor v-if="enableEditor" :toolbars="toolbars" ref="mdEditorRef" style="height: 440px;max-height: 60vh;text-align: left"
                 :modelValue="data.airesult" :theme="theme">
         <template #defToolbars>
@@ -2737,6 +2821,7 @@ watch(modalShow6, (newVal) => {
           </n-tag>
           {{ data.time }}
         </n-text>
+        <n-text type="success" v-if="data.analysisStatus">{{ data.analysisStatus }}</n-text>
         <n-text type="error">*AI分析结果仅供参考，请以实际行情为准。投资需谨慎，风险自担。</n-text>
       </n-flex>
     </template>

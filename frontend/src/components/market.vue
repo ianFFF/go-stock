@@ -38,6 +38,7 @@ import HotTopics from "./HotTopics.vue";
 import InvestCalendarTimeLine from "./InvestCalendarTimeLine.vue";
 import ClsCalendarTimeLine from "./ClsCalendarTimeLine.vue";
 import Stockhotmap from "./stockhotmap.vue";
+import BKFundFlowChart from "./bkFundFlowChart.vue";
 
 const route = useRoute()
 const icon = ref('https://raw.githubusercontent.com/ArvinLovegood/go-stock/master/build/appicon.png');
@@ -70,6 +71,7 @@ const question = ref(``)
 const aiConfigId = ref(null)
 const sysPromptId = ref(null)
 const loading = ref(true)
+const analysisStatus = ref('')
 const aiConfigs = ref([])
 const sysPromptOptions = ref([])
 const userPromptOptions = ref([])
@@ -260,6 +262,7 @@ function reAiSummary() {
   aiSummary.value = ""
   summaryModal.value = true
   loading.value = true
+  analysisStatus.value = "正在连接AI服务..."
   SummaryStockNews(question.value,aiConfigId.value, sysPromptId.value,enableTools.value,thinkingMode.value,"summaryStockNews","")
 }
 
@@ -299,9 +302,17 @@ function updateTab(name) {
 EventsOn("summaryStockNews", async (msg) => {
   if (msg === "DONE") {
     await SaveAIResponseResult("市场资讯", "市场资讯", aiSummary.value, chatId.value, question.value,aiConfigId.value)
-    message.info("AI分析完成！")
-    message.destroyAll()
     loading.value = false
+    analysisStatus.value = "分析完成"
+    message.destroyAll()
+    notify.success({
+      title: 'AI分析完成',
+      content: '市场资讯分析已完成',
+      duration: 3000,
+    })
+    setTimeout(() => {
+      analysisStatus.value = ""
+    }, 3000)
   } else {
     if (msg.chatId) {
       chatId.value = msg.chatId
@@ -310,6 +321,9 @@ EventsOn("summaryStockNews", async (msg) => {
       question.value = msg.question
     }
     if (msg.content || msg.reasoning_content || msg.extraContent) {
+      if (!aiSummary.value) {
+        analysisStatus.value = "AI正在分析中..."
+      }
       loading.value = false
     }
     if (msg.content) {
@@ -700,6 +714,9 @@ function ReFlesh(source) {
           </n-tab-pane>
         </n-tabs>
       </n-tab-pane>
+      <n-tab-pane name="板块资金流向" tab="板块资金流向">
+        <BKFundFlowChart :dark-theme="darkTheme" :chart-height="600"/>
+      </n-tab-pane>
       <n-tab-pane name="龙虎榜" tab="龙虎榜">
         <LongTigerRankList />
       </n-tab-pane>
@@ -751,7 +768,7 @@ function ReFlesh(source) {
   </n-card>
   <n-modal transform-origin="center" v-model:show="summaryModal" preset="card" style="width: 800px;max-width: calc(100vw - 32px);"
            :title="'AI市场资讯总结'">
-    <n-spin size="small" :show="loading">
+    <n-spin size="small" :show="loading && !aiSummary">
       <div ref="aiResultScrollRef" style="height: 440px;max-height: 60vh;text-align: left;overflow-y: auto;">
         <MdPreview ref="mdPreviewRef" :modelValue="aiSummary" :theme="theme"/>
       </div>
@@ -762,6 +779,7 @@ function ReFlesh(source) {
           <n-tag v-if="modelName" type="warning" round :title="chatId" :bordered="false">{{ modelName }}</n-tag>
           {{ aiSummaryTime }}
         </n-text>
+        <n-text type="success" v-if="analysisStatus">{{ analysisStatus }}</n-text>
         <n-text type="error">*AI分析结果仅供参考，请以实际行情为准。投资需谨慎，风险自担。</n-text>
       </n-flex>
     </template>

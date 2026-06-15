@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"go-stock/backend/agent/tools"
 	"go-stock/backend/data"
@@ -14,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/bytedance/sonic"
 	einomcp "github.com/cloudwego/eino-ext/components/tool/mcp"
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/adk/prebuilt/planexecute"
@@ -22,8 +22,6 @@ import (
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/flow/agent/react"
 	"github.com/cloudwego/eino/schema"
-	mcpclient "github.com/mark3labs/mcp-go/client"
-	"github.com/mark3labs/mcp-go/mcp"
 )
 
 type AgentMode string
@@ -136,10 +134,14 @@ func createReactAgent(ctx context.Context, chatModel model.ToolCallingChatModel,
 		},
 	}
 
+	maxStep := len(allTools)*2 + 10
+	if maxStep < 30 {
+		maxStep = 30
+	}
 	agent, err := react.NewAgent(ctx, &react.AgentConfig{
 		ToolCallingModel: chatModel,
 		ToolsConfig:      aiTools,
-		MaxStep:          len(allTools) + 15,
+		MaxStep:          maxStep,
 		MessageRewriter: func(ctx context.Context, input []*schema.Message) []*schema.Message {
 			maxTokens := getMaxInputTokens(aiConfig.MaxTokens)
 			return compressMessages(input, maxTokens)
@@ -211,7 +213,7 @@ func createPlanExecuteAgent(ctx context.Context, chatModel model.ToolCallingChat
 		Planner:       planner,
 		Executor:      executor,
 		Replanner:     replanner,
-		MaxIterations: 12,
+		MaxIterations: 7,
 	})
 	if err != nil {
 		logger.SugaredLogger.Errorf("创建PlanExecute Agent失败: %v", err)
@@ -422,22 +424,9 @@ func getMCPTools() []tool.BaseTool {
 			continue
 		}
 
-		cli, err := mcpclient.NewStreamableHttpClient(server.URL)
+		cli, err := data.InitMCPClient(ctx, &server)
 		if err != nil {
-			logger.SugaredLogger.Errorf("创建MCP客户端失败 [%s]: %v", server.Name, err)
-			continue
-		}
-
-		initRequest := mcp.InitializeRequest{}
-		initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
-		initRequest.Params.ClientInfo = mcp.Implementation{
-			Name:    "go-stock",
-			Version: "1.0.0",
-		}
-
-		_, err = cli.Initialize(ctx, initRequest)
-		if err != nil {
-			logger.SugaredLogger.Errorf("初始化MCP连接失败 [%s]: %v", server.Name, err)
+			logger.SugaredLogger.Errorf("MCP客户端初始化失败 [%s]: %v", server.Name, err)
 			continue
 		}
 
@@ -494,11 +483,13 @@ func genPlannerInput(ctx context.Context, userInput []adk.Message) ([]adk.Messag
 		return userInput, nil
 	}
 
-	systemMsg := schema.SystemMessage(`你是股票分析规划师。将用户目标拆解为3-4步执行计划。
-规则：步骤具体独立、按最优顺序、无冗余，末步须产出完整答案。
-
-【重要】你必须且只能通过内置函数/工具「plan」输出计划：调用 plan，参数为 JSON，字段 steps 为字符串数组。
-禁止仅用自然语言或 Markdown 列出步骤（那样无法被系统解析）；不要输出未包裹在 plan 工具调用里的步骤列表。`)
+	systemMsg := schema.SystemMessage(`你是一个任务规划助手。请将用户的问题拆解为3-5个具体的执行步骤。
+规则：
+1. 每个步骤必须具体、可独立执行
+2. 步骤之间按逻辑顺序排列
+3. 最后一个步骤必须是汇总分析并给出最终答案
+4. 你必须通过调用 plan 工具来输出计划（参数为JSON格式，包含 steps 字段，值为字符串数组）
+5. 不要仅用文字描述计划，必须实际调用 plan 工具`)
 
 	userMsg := schema.UserMessage(question)
 
@@ -971,9 +962,13 @@ func genExecutorInput(ctx context.Context, in *planexecute.ExecutionContext) ([]
 
 	question := extractUserQuestion(in.UserInput)
 
-	systemMsg := schema.SystemMessage(`按计划执行当前步骤，调用工具获取数据，给出简洁精准的分析结果。`)
+	systemMsg := schema.SystemMessage(`你是一个任务执行助手。请按照计划执行当前步骤，通过调用可用的工具获取所需数据，并给出该步骤的分析结果。
+注意：
+1. 只执行当前步骤，不要跳过
+2. 充分利用工具获取真实数据，不要编造数据
+3. 给出简洁、精准的分析结果`)
 
-	userMsg := schema.UserMessage(fmt.Sprintf("目标: %s\n\n当前计划: %s\n\n已完成步骤:\n%s\n\n请执行当前步骤: %s",
+	userMsg := schema.UserMessage(fmt.Sprintf("用户问题: %s\n\n当前计划:\n%s\n\n已完成的步骤及结果:\n%s\n【请执行当前步骤】: %s",
 		question, string(planContent), stepsContent.String(), in.Plan.FirstStep()))
 
 	return []adk.Message{systemMsg, userMsg}, nil
@@ -993,52 +988,45 @@ func genReplannerInput(ctx context.Context, in *planexecute.ExecutionContext) ([
 		stepsContent.WriteString(fmt.Sprintf("步骤: %s\n结果: %s\n\n", s.Step, result))
 	}
 
-	var remainingStepsStr string
-	var planObj struct {
+	var remainingStepsContent string
+	var planSteps struct {
 		Steps []string `json:"steps"`
 	}
-	if err := json.Unmarshal(planContent, &planObj); err == nil && len(planObj.Steps) > 0 {
-		executedSet := make(map[string]bool)
+	if err := sonic.Unmarshal(planContent, &planSteps); err == nil {
+		executedSet := make(map[string]bool, len(in.ExecutedSteps))
 		for _, s := range in.ExecutedSteps {
 			executedSet[s.Step] = true
 		}
 		var remaining []string
-		for _, step := range planObj.Steps {
+		for _, step := range planSteps.Steps {
 			if !executedSet[step] {
 				remaining = append(remaining, step)
 			}
 		}
 		if len(remaining) > 0 {
-			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("⚠️ 还有 %d 个步骤未执行：\n", len(remaining)))
+			remainingStepsContent = fmt.Sprintf("⚠️ 还有 %d 个步骤未执行：\n", len(remaining))
 			for i, step := range remaining {
-				sb.WriteString(fmt.Sprintf("  %d. %s\n", i+1, step))
+				remainingStepsContent += fmt.Sprintf("  %d. %s\n", i+1, step)
 			}
-			sb.WriteString("\n【必须调用 plan 工具继续执行，不能跳过这些步骤】")
-			remainingStepsStr = sb.String()
+			remainingStepsContent += "\n【必须调用 plan 工具继续执行，不能跳过这些步骤】\n"
 		} else {
-			remainingStepsStr = "✅ 所有计划步骤已执行完毕。"
+			remainingStepsContent = "✅ 所有计划步骤已执行完毕。\n"
 		}
 	}
 
 	question := extractUserQuestion(in.UserInput)
 
-	systemMsg := schema.SystemMessage(`审核执行进度并决定下一步。
+	systemMsg := schema.SystemMessage(`你是一个任务审核助手。请根据已完成的步骤结果，决定下一步操作。
 
-【重要】你必须严格遵守以下规则：
-1. 只有当所有计划步骤均已执行完毕时，才能调用 respond 工具输出最终结论
-2. 如果还有未执行的步骤，必须调用 plan 工具继续执行剩余步骤
-3. 即使你认为已能推断出结论，也不允许跳过未执行步骤
-4. 判定标准：看下面的"剩余未执行步骤"部分——有内容就必须调用 plan，显示"所有计划步骤已执行完毕"才调用 respond
+你只能选择以下两种操作之一（必须通过工具调用function call执行，禁止仅用文字描述）：
+1. 调用 respond 工具：当且仅当所有计划步骤都已执行完毕时使用，参数为 {"response": "完整的最终分析答复"}
+2. 调用 plan 工具：当还有未执行的步骤时使用，参数为 {"steps": ["剩余步骤1", "剩余步骤2", ...]}，不要包含已完成的步骤
 
-你只能二选一，且必须通过工具调用（function calling）完成：
-- 若还有未执行步骤：调用「plan」，参数 JSON 含字段 steps（剩余未完成步骤的字符串数组）
-- 若所有步骤已完成：调用「respond」，参数 JSON 含字段 response（完整最终答复）
+判断方法：查看下方"未执行的步骤"部分，如果有内容则调用plan继续执行；如果显示"所有步骤已完成"则调用respond给出最终答复。
+禁止：仅用文字描述将要做什么而不实际调用工具。`)
 
-不要描述「我将调用 plan」；必须实际发出 plan 或 respond 工具调用。`)
-
-	userMsg := schema.UserMessage(fmt.Sprintf("目标: %s\n\n原始计划: %s\n\n已完成步骤:\n%s\n\n剩余未执行步骤:\n%s",
-		question, string(planContent), stepsContent.String(), remainingStepsStr))
+	userMsg := schema.UserMessage(fmt.Sprintf("用户问题: %s\n\n原始计划:\n%s\n\n已完成的步骤及结果:\n%s\n%s",
+		question, string(planContent), stepsContent.String(), remainingStepsContent))
 
 	return []adk.Message{systemMsg, userMsg}, nil
 }

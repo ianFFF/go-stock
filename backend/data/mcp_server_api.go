@@ -12,6 +12,7 @@ import (
 
 	einomcp "github.com/cloudwego/eino-ext/components/tool/mcp"
 	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -34,6 +35,8 @@ func (a *MCPServerApi) Update(server *models.MCPServer) error {
 		"name":        server.Name,
 		"description": server.Description,
 		"url":         server.URL,
+		"type":        server.Type,
+		"headers":     server.Headers,
 		"command":     server.Command,
 		"args":        server.Args,
 		"env":         server.Env,
@@ -129,6 +132,58 @@ func (a *MCPServerApi) SearchServers(keyword string) []models.MCPServer {
 	return servers
 }
 
+func parseMCPHeaders(headersStr string) map[string]string {
+	if headersStr == "" {
+		return nil
+	}
+	var headers map[string]string
+	if err := json.Unmarshal([]byte(headersStr), &headers); err != nil {
+		logger.SugaredLogger.Warnf("解析MCP Headers失败: %v", err)
+		return nil
+	}
+	return headers
+}
+
+func CreateMCPClient(server *models.MCPServer) (*client.Client, error) {
+	headers := parseMCPHeaders(server.Headers)
+
+	switch server.Type {
+	case "sse":
+		opts := []transport.ClientOption{}
+		if len(headers) > 0 {
+			opts = append(opts, transport.WithHeaders(headers))
+		}
+		return client.NewSSEMCPClient(server.URL, opts...)
+	default:
+		opts := []transport.StreamableHTTPCOption{}
+		if len(headers) > 0 {
+			opts = append(opts, transport.WithHTTPHeaders(headers))
+		}
+		return client.NewStreamableHttpClient(server.URL, opts...)
+	}
+}
+
+func InitMCPClient(ctx context.Context, server *models.MCPServer) (*client.Client, error) {
+	cli, err := CreateMCPClient(server)
+	if err != nil {
+		return nil, fmt.Errorf("创建MCP客户端失败: %w", err)
+	}
+
+	initRequest := mcp.InitializeRequest{}
+	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initRequest.Params.ClientInfo = mcp.Implementation{
+		Name:    "go-stock",
+		Version: "1.0.0",
+	}
+
+	_, err = cli.Initialize(ctx, initRequest)
+	if err != nil {
+		return nil, fmt.Errorf("初始化MCP连接失败: %w", err)
+	}
+
+	return cli, nil
+}
+
 func (a *MCPServerApi) TestConnection(id uint) (string, error) {
 	server, err := a.GetByID(id)
 	if err != nil {
@@ -145,23 +200,9 @@ func (a *MCPServerApi) TestConnection(id uint) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cli, err := client.NewStreamableHttpClient(server.URL)
+	cli, err := InitMCPClient(ctx, server)
 	if err != nil {
-		errMsg := fmt.Sprintf("创建MCP客户端失败: %s", err.Error())
-		a.UpdateStatus(id, "unavailable", errMsg)
-		return "", fmt.Errorf("%s", errMsg)
-	}
-
-	initRequest := mcp.InitializeRequest{}
-	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
-	initRequest.Params.ClientInfo = mcp.Implementation{
-		Name:    "go-stock",
-		Version: "1.0.0",
-	}
-
-	_, err = cli.Initialize(ctx, initRequest)
-	if err != nil {
-		errMsg := fmt.Sprintf("初始化MCP连接失败: %s", err.Error())
+		errMsg := err.Error()
 		a.UpdateStatus(id, "unavailable", errMsg)
 		return "", fmt.Errorf("%s", errMsg)
 	}

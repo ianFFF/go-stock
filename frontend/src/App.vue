@@ -26,6 +26,7 @@ import {
   SettingsOutline, ServerOutline, Skull, SkullOutline, SkullSharp,
   SparklesOutline, FlashOutline, Star,
   StarOutline,
+  StatsChartOutline,
   Wallet, WarningOutline, TimeOutline, SearchOutline,
 } from '@vicons/ionicons5'
 import {AnalyzeSentiment, GetConfig, GetGroupList, GetVersionInfo, IsTradingTime, IsHKTradingTime, IsUSTradingTime} from "../wailsjs/go/main/App";
@@ -296,6 +297,28 @@ const menuOptions = ref([
                   to: {
                     name: 'market',
                     query: {
+                      name: "板块资金流向",
+                    }
+                  },
+                  onClick: () => {
+                    activeKey.value = 'market'
+                    EventsEmit("changeMarketTab", {ID: 0, name: '板块资金流向'})
+                  },
+                },
+                {default: () => '板块资金流向',}
+            ),
+        key: 'market5_1',
+        icon: renderIcon(ReportMoney),
+      },
+      {
+        label: () =>
+            h(
+                RouterLink,
+                {
+                  href: '#',
+                  to: {
+                    name: 'market',
+                    query: {
                       name: "龙虎榜",
                     }
                   },
@@ -420,6 +443,23 @@ const menuOptions = ref([
         icon: renderIcon(FirefoxBrowser),
       },
     ]
+  },
+  {
+    label: () =>
+        h(
+            RouterLink,
+            {
+              to: {
+                name: 'klineAnalysis',
+              },
+              onClick: () => {
+                activeKey.value = 'klineAnalysis'
+              },
+            },
+            {default: () => 'K线分析'}
+        ),
+    key: 'klineAnalysis',
+    icon: renderIcon(StatsChartOutline),
   },
   {
     label: () =>
@@ -946,6 +986,14 @@ EventsOn("loadingMsg", (data) => {
   }
 })
 
+setTimeout(() => {
+  if (loading.value) {
+    loading.value = false
+    loadingMsg.value = "加载完成..."
+    EventsEmit("loadingDone", "app")
+  }
+}, 8000)
+
 onBeforeUnmount(() => {
   if (marketStatusTimer) {
     clearInterval(marketStatusTimer)
@@ -977,12 +1025,13 @@ onBeforeMount(() => {
     }
     officialStatement.value = result.officialStatement || ""
     updateMarketStatus()
+  }).catch(err => {
+    console.error("GetVersionInfo error:", err)
   })
 
   GetGroupList().then(result => {
     groupList.value = result
     menuOptions.value.map((item) => {
-      //console.log(item)
       if (item.key === 'stock') {
         item.children.push(...groupList.value.map(item => {
           return {
@@ -993,7 +1042,6 @@ onBeforeMount(() => {
                       href: '#',
                       type: 'info',
                       onClick: () => {
-                        //console.log("push",item)
                         router.push({
                           name: 'stock',
                           query: {
@@ -1020,11 +1068,12 @@ onBeforeMount(() => {
         }))
       }
     })
+  }).catch(err => {
+    console.error("GetGroupList error:", err)
   })
 
 
   GetConfig().then((res) => {
-    //console.log(res)
     enableFund.value = res.enableFund
     enableAgent.value = res.enableAgent
 
@@ -1042,6 +1091,8 @@ onBeforeMount(() => {
     } else {
       enableDarkTheme.value = null
     }
+  }).catch(err => {
+    console.error("GetConfig error:", err)
   })
 })
 
@@ -1094,6 +1145,8 @@ onMounted(() => {
         })
       }
     })
+  }).catch(err => {
+    console.error("GetConfig(onMounted) error:", err)
   })
 })
 </script>
